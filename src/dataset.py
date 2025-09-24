@@ -5,7 +5,7 @@ import torchvision.transforms.functional as F
 import random
 
 
-def pad_and_crop(img, target_size):
+def pad_and_crop(img, target_size, top=None, left=None):
     """Pad first (if needed), then random crop to target_size (H, W).
     Works with [C,H,W] or [N,C,H,W].
     """
@@ -29,17 +29,18 @@ def pad_and_crop(img, target_size):
         pad_left = pad_w // 2
         pad_right = pad_w - pad_left
         img = F.pad(img, (pad_left, pad_top, pad_right, pad_bottom), fill=0)
-        _, _, h, w = img.shape
 
     # ---- Step 2: random crop ----
-    top = random.randint(0, h - th) if h > th else 0
-    left = random.randint(0, w - tw) if w > tw else 0
+    if top is None:
+        top = random.randint(0, h - th) if h > th else 0
+    if left is None:
+        left = random.randint(0, w - tw) if w > tw else 0
     img = img[..., top:top+th, left:left+tw]  # [N,C,th,tw]
-
+    
     if squeeze_back:
         img = img.squeeze(0)  # return [C,H,W]
 
-    return img
+    return img, top, left
 
 
 class PairedDataset(torch.utils.data.Dataset):
@@ -75,18 +76,18 @@ class PairedDataset(torch.utils.data.Dataset):
 
         img_t = F.to_tensor(input_img)
         #img_t = F.resize(img_t, self.image_size)
-        img_t = pad_and_crop(img_t, self.image_size)
+        img_t, top, left = pad_and_crop(img_t, self.image_size)
         img_t = F.normalize(img_t, mean=[0.5], std=[0.5])
 
         output_t = F.to_tensor(output_img)
-        output_t = pad_and_crop(output_t, self.image_size)
+        output_t, _, _ = pad_and_crop(output_t, self.image_size, top, left)
         #output_t = F.resize(output_t, self.image_size)
         output_t = F.normalize(output_t, mean=[0.5], std=[0.5])
 
         if ref_img is not None:
             ref_img = Image.open(ref_img)
             ref_t = F.to_tensor(ref_t)
-            ref_t = pad_and_crop(ref_t, self.image_size)
+            ref_t, _, _ = pad_and_crop(ref_t, self.image_size)
             #ref_t = F.resize(ref_t, self.image_size)
             ref_t = F.normalize(ref_t, mean=[0.5], std=[0.5])
         
@@ -146,11 +147,11 @@ class PairedDatasetCus(torch.utils.data.Dataset):
 
         img_t = F.to_tensor(input_img)
         #img_t = F.resize(img_t, self.image_size)
-        img_t = pad_and_crop(img_t, self.image_size)
+        img_t, top, left = pad_and_crop(img_t, self.image_size)
         img_t = F.normalize(img_t, mean=[0.5], std=[0.5])
 
         output_t = F.to_tensor(output_img)
-        output_t = pad_and_crop(output_t, self.image_size)
+        output_t, _, _ = pad_and_crop(output_t, self.image_size, top, left)
         #output_t = F.resize(output_t, self.image_size)
         output_t = F.normalize(output_t, mean=[0.5], std=[0.5])
 
@@ -178,7 +179,7 @@ class PairedDatasetCus(torch.utils.data.Dataset):
                 ref_img = "/".join(parts[:-1] + [neighbor_id + "_target.png"])
                 ref_t = Image.open(ref_img)
                 ref_t = F.to_tensor(ref_t)
-                ref_t = pad_and_crop(ref_t, self.image_size)
+                ref_t, _, _ = pad_and_crop(ref_t, self.image_size)
                 ref_t = F.normalize(ref_t, mean=[0.5], std=[0.5])
             else:
                 # make a blank normalized image with same shape as img_t
@@ -209,16 +210,15 @@ class PairedDatasetCus(torch.utils.data.Dataset):
                 ref_ts = [F.to_tensor(img) for img in loaded]          # list of [C,H,W]
                 ref_ts = torch.stack(ref_ts, dim=0)                   # [N,C,H,W]
 
-                #ref_ts = pad_and_crop(ref_ts, self.image_size)        # assume supports batch
-                #ref_ts_small = F.resize(ref_ts, [self.image_size[0]//4, self.image_size[1]//4])
-                
+                _, h, w = ref_ts[0].shape 
 
                 # 1. Resize first (downscale)
-                small_size = [self.image_size[0] // 4, self.image_size[1] // 4]
+                small_size = [h // 4, w // 4]
                 ref_ts_small = F.resize(ref_ts, small_size)  # [N,C,h,w]
 
                 # 2. Pad/crop at the smaller resolution
-                ref_ts_small = pad_and_crop(ref_ts_small, small_size)  
+                small_size = [self.image_size[0] // 4, self.image_size[1] // 4]
+                ref_ts_small, _, _ = pad_and_crop(ref_ts_small, small_size)  
 
                 ref_ts_small = F.normalize(ref_ts_small, mean=[0.5], std=[0.5])   # [N,C,H,W]
 
@@ -230,7 +230,7 @@ class PairedDatasetCus(torch.utils.data.Dataset):
                 row = torch.cat(list(refs[i*4:(i+1)*4]), dim=2)   # concat along width
                 rows.append(row)
             ref_t = torch.cat(rows, dim=1)                     # concat rows along height
-
+        
         img_t = torch.stack([img_t, ref_t], dim=0)
         output_t = torch.stack([output_t, ref_t], dim=0)
 

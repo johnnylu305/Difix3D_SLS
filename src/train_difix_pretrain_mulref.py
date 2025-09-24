@@ -30,6 +30,18 @@ from loss import gram_loss
 from pipeline_difix import DifixPipeline
 
 
+
+def to_uint8(img: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a tensor in range [-1,1] to uint8 [0,255].
+    Accepts CHW or BCHW tensors.
+    """
+    img = img.clamp(-1, 1)         # step 1: clip
+    img = (img + 1.0) / 2.0        # step 2: rescale to [0,1]
+    img = (img * 255).round()      # step 3: scale to [0,255]
+    return img.to(torch.uint8)
+
+
 def load_pipe_weights_into_model(pipe, model, report: bool = True):
     """
     Load weights from a DifixPipeline (pipe) into a Difix model (model).
@@ -279,9 +291,9 @@ def main(args):
                     # viz some images
                     if global_step % args.viz_freq == 1:
                         log_dict = {
-                            "train/source": [wandb.Image(rearrange(x_src, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                            "train/target": [wandb.Image(rearrange(x_tgt, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                            "train/model_output": [wandb.Image(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
+                            "train/source": [wandb.Image(to_uint8(rearrange(x_src, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
+                            "train/target": [wandb.Image(to_uint8(rearrange(x_tgt, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
+                            "train/model_output": [wandb.Image(to_uint8(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
                         }
                         for k in log_dict:
                             logs[k] = log_dict[k]
@@ -308,9 +320,9 @@ def main(args):
                                 x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
                                 
                                 if step % 10 == 0:
-                                    log_dict["sample/source"].append(wandb.Image(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
-                                    log_dict["sample/target"].append(wandb.Image(rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
-                                    log_dict["sample/model_output"].append(wandb.Image(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
+                                    log_dict["sample/source"].append(wandb.Image(to_uint8(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
+                                    log_dict["sample/target"].append(wandb.Image(to_uint8(rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
+                                    log_dict["sample/model_output"].append(wandb.Image(to_uint8(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
                                 
                                 x_tgt = x_tgt[:, 0] # take the input view
                                 x_tgt_pred = x_tgt_pred[:, 0] # take the input view
