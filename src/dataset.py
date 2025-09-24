@@ -156,18 +156,22 @@ class PairedDatasetCus(torch.utils.data.Dataset):
         parts = path.split("/")
         ref_img = "/".join(parts[:-1] + [neighbor_id+"_target.png"])
 
-        if ref_img is not None:
+        # check if neighbor is valid (same scene prefix)
+        scene_id = img_id.split("_val_")[0]
+        use_neighbor = neighbor_id is not None and neighbor_id.split("_val_")[0] == scene_id
+
+        if use_neighbor:
+            ref_img = "/".join(parts[:-1] + [neighbor_id + "_target.png"])
             ref_t = Image.open(ref_img)
             ref_t = F.to_tensor(ref_t)
             ref_t = pad_and_crop(ref_t, self.image_size)
-            #ref_t = F.resize(ref_t, self.image_size)
             ref_t = F.normalize(ref_t, mean=[0.5], std=[0.5])
-        
-            img_t = torch.stack([img_t, ref_t], dim=0)
-            output_t = torch.stack([output_t, ref_t], dim=0)            
         else:
-            img_t = img_t.unsqueeze(0)
-            output_t = output_t.unsqueeze(0)
+            # make a blank normalized image with same shape as img_t
+            ref_t = torch.full_like(img_t, -1.0)
+
+        img_t = torch.stack([img_t, ref_t], dim=0)
+        output_t = torch.stack([output_t, ref_t], dim=0)
 
         out = {
             "output_pixel_values": output_t,
