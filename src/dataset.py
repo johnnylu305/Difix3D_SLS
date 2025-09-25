@@ -113,7 +113,7 @@ class PairedDataset(torch.utils.data.Dataset):
         return out
 
 class PairedDatasetCus(torch.utils.data.Dataset):
-    def __init__(self, dataset_path, split, height=512, width=512, tokenizer=None, mulref=False):
+    def __init__(self, dataset_path, split, height=512, width=512, tokenizer=None, mulref=False, nv=1):
     #def __init__(self, dataset_path, split, height=576, width=1024, tokenizer=None):
 
         super().__init__()
@@ -124,6 +124,7 @@ class PairedDatasetCus(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.img_ids_sorted = sorted(self.img_ids)
         self.mulref = mulref
+        self.nv = nv
 
     def __len__(self):
 
@@ -189,12 +190,14 @@ class PairedDatasetCus(torch.utils.data.Dataset):
             scene_id = img_id.split("_val_")[0]
             scene_ids = [iid for iid in self.img_ids_sorted if iid.split("_val_")[0] == scene_id and iid != img_id]
 
+            factor = int(self.nv**0.5)
+
             # --- step 2: sample up to 16 neighbors ---
-            chosen_ids = random.sample(scene_ids, k=min(16, len(scene_ids)))
+            chosen_ids = random.sample(scene_ids, k=min(self.nv, len(scene_ids)))
 
             # --- step 3: pre-fill blanks (16 slots) ---
             refs = torch.full(
-                (16, 3, self.image_size[0]//4, self.image_size[1]//4),
+                (self.nv, 3, self.image_size[0]//factor, self.image_size[1]//factor),
                 -1.0
             )  # [16,C,H/4,W/4]
 
@@ -213,11 +216,11 @@ class PairedDatasetCus(torch.utils.data.Dataset):
                 _, h, w = ref_ts[0].shape 
 
                 # 1. Resize first (downscale)
-                small_size = [h // 4, w // 4]
+                small_size = [h // factor, w // factor]
                 ref_ts_small = F.resize(ref_ts, small_size)  # [N,C,h,w]
 
                 # 2. Pad/crop at the smaller resolution
-                small_size = [self.image_size[0] // 4, self.image_size[1] // 4]
+                small_size = [self.image_size[0] // factor, self.image_size[1] // factor]
                 ref_ts_small, _, _ = pad_and_crop(ref_ts_small, small_size)  
 
                 ref_ts_small = F.normalize(ref_ts_small, mean=[0.5], std=[0.5])   # [N,C,H,W]
@@ -226,8 +229,8 @@ class PairedDatasetCus(torch.utils.data.Dataset):
 
             # --- step 5: tile 16 small refs into 4x4 grid ---
             rows = []
-            for i in range(4):
-                row = torch.cat(list(refs[i*4:(i+1)*4]), dim=2)   # concat along width
+            for i in range(factor):
+                row = torch.cat(list(refs[i*factor:(i+1)*factor]), dim=2)   # concat along width
                 rows.append(row)
             ref_t = torch.cat(rows, dim=1)                     # concat rows along height
         
