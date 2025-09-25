@@ -231,7 +231,8 @@ class Difix(torch.nn.Module):
         
         unet_input = z
         
-        model_pred = self.unet(unet_input, self.timesteps, encoder_hidden_states=caption_enc,).sample
+        model_pred = self.unet(unet_input, self.timesteps, encoder_hidden_states=caption_enc, ).sample
+        
         z_denoised = self.sched.step(model_pred, self.timesteps, z, return_dict=True).prev_sample
         self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
         output_image = (self.vae.decode(z_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)

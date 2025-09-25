@@ -29,6 +29,120 @@ from dataset import PairedDatasetCus
 from loss import gram_loss
 from pipeline_difix import DifixPipeline
 
+import math
+import matplotlib.pyplot as plt
+os.makedirs("./output_att", exist_ok=True)
+# will hold the three processors so we can read their .last_attn_probs after a forward
+REC_PROCS = {"down": None} #, "mid": None, "up": None}
+ATT_HW = {"down": (128, 64)} #, "mid": , "up": None}
+
+def save_avg_attn_map(avg_vec: torch.Tensor, name: str, h: int, w: int, outdir="./output_att"):
+    os.makedirs(outdir, exist_ok=True)
+
+    # ---- sanitize tensor ----
+    if not isinstance(avg_vec, torch.Tensor):
+        raise TypeError(f"avg_vec must be a torch.Tensor, got {type(avg_vec)}")
+    vec = avg_vec.detach().to(torch.float32).cpu()
+    if vec.ndim == 2:
+        vec = vec[0]  # take first in batch
+    elif vec.ndim != 1:
+        raise ValueError(f"avg_vec must be 1D or 2D, got shape {tuple(avg_vec.shape)}")
+
+    K = vec.numel()
+    hw = h * w
+
+    # ---- reshape: single-view or multi-view ----
+    if K == hw:
+        att_map = vec.view(h, w)
+    elif K % hw == 0:
+        V = K // hw
+        # average across views if multiple are concatenated
+        maps = []
+        for v in range(V):
+            start, end = v * hw, (v + 1) * hw
+            maps.append(vec[start:end].view(h, w))
+        att_map = torch.stack(maps, dim=0).mean(dim=0)
+    else:
+        raise ValueError(f"Cannot reshape K={K} into ({h}x{w}) or its multiples.")
+
+    # ---- normalize to [0,1] for visualization ----
+    amin = float(att_map.min())
+    amax = float(att_map.max())
+    att_vis = (att_map - amin) / (amax - amin + 1e-8)
+
+    # ---- save (no title, no axis, no colorbar, no whitespace) ----
+    plt.imshow(att_vis.numpy(), cmap="jet", interpolation="nearest")
+    plt.axis("off")
+    out_path = os.path.join(outdir, f"{name}_avg.png")
+    plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
+    plt.close()
+
+    print(f"[save_avg_attn_map] saved: {out_path}")
+
+class RecordingAttnProcessor:
+    """
+    Callable processor compatible with diffusers' Attention.set_processor().
+    Computes attention the standard way and stores probs in .last_attn_probs.
+    """
+    def __init__(self, tag: str):
+        self.tag = tag
+        self.last_attn_probs = None  # [B, H, Q, K]
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, **kwargs):
+
+        # hidden_states.shape: (B, Seq, D)
+        # ex: Seq = H // 8 x W // 8
+        # Projections (same as AttnProcessor2_0 pattern)
+        q = attn.to_q(hidden_states)
+        k_src = hidden_states if encoder_hidden_states is None else encoder_hidden_states
+        k = attn.to_k(k_src)
+        v = attn.to_v(k_src)
+        
+        # (B, Seq, D)
+        bsz, q_len, dim = q.shape
+        # multi-head attention
+        # ex: 5
+        heads = attn.heads
+        # ex: 64 = 320 // 5 
+        head_dim = dim // heads
+        scale = getattr(attn, "scale", 1.0 / math.sqrt(head_dim))
+
+        def _shape(x):
+            # [B, T, D] -> [B, H, T, Dh]
+            return x.view(bsz, -1, heads, head_dim).transpose(1, 2)
+
+        q = _shape(q)
+        k = _shape(k)
+        v = _shape(v)
+
+        # Scores and probs
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B,H,Q,K]
+        if attention_mask is not None:
+            scores = scores + attention_mask  # mask is bias
+        probs = torch.softmax(scores.float(), dim=-1).to(scores.dtype)  # [B,H,Q,K]
+        # ex: Q = H//8 x W//8
+        # ex: K = H//8 x W//8
+        self.last_attn_probs = probs.detach()
+
+        # === Average attention map ===
+        # mean over heads and over queries -> [B, K]
+        avg_attn_vec = probs.mean((1, 2))          # [B, K]
+        self.avg_attn_vec = avg_attn_vec.detach().to(torch.float32)
+        #print("h", torch.unique(hidden_states))
+        #print("q", torch.unique(q))
+        #print("k", torch.unique(k))
+        #print("s", torch.unique(scores))
+        #print("probs", torch.unique(probs))
+        #print("avg", torch.unique(avg_attn_vec))
+        #print("avg2", torch.unique(self.avg_attn_vec))
+        # Weighted sum (standard attention output)
+        # return for mv_net training
+        out = torch.matmul(probs, v)  # [B,H,Q,Dh]
+        out = out.transpose(1, 2).reshape(bsz, q_len, heads * head_dim)  # [B,Q,D]
+        out = attn.to_out[0](out)
+        out = attn.to_out[1](out)
+        return out
 
 
 def to_uint8(img: torch.Tensor) -> torch.Tensor:
@@ -116,12 +230,33 @@ def main(args):
         timestep=args.timestep,
         mv_unet=args.mv_unet,
     )
+
+    # get attention
+    # --- attach processors to exactly one down/mid/up self-attn (attn1) ---
+    unet_ref = net_difix.unet  # keep a non-wrapped reference for name matching (before accelerator.prepare)
+    down_set = mid_set = up_set = False
+    for name, module in unet_ref.named_modules():
+        if hasattr(module, "attn1"):
+            if (not down_set) and ("down_blocks.0" in name):
+                REC_PROCS["down"] = RecordingAttnProcessor("down")
+                module.attn1.set_processor(REC_PROCS["down"])
+                down_set = True
+            elif (not mid_set) and ("mid_block" in name):
+                REC_PROCS["mid"] = RecordingAttnProcessor("mid")
+                module.attn1.set_processor(REC_PROCS["mid"])
+                mid_set = True
+            elif (not up_set) and ("up_blocks.0" in name):
+                REC_PROCS["up"] = RecordingAttnProcessor("up")
+                module.attn1.set_processor(REC_PROCS["up"])
+                up_set = True
+
     # Original difix
     pipe = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
     pipe.to("cuda")
     load_pipe_weights_into_model(pipe, net_difix, report=True)
     del pipe
     net_difix.set_train()
+
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -239,7 +374,16 @@ def main(args):
 
                 # forward pass
                 x_tgt_pred = net_difix(x_src, prompt_tokens=batch["input_ids"])       
-                
+               
+                # get attention
+                if accelerator.is_main_process and (global_step % args.viz_freq == 1):
+                    _, V, _, _, _ = x_src.shape  # number of views in this batch
+                    for tag in ("down",):
+                        proc = REC_PROCS[tag]
+                        h, w = ATT_HW[tag]
+                        if proc is not None and proc.last_attn_probs is not None:
+                            save_avg_attn_map(proc.avg_attn_vec, tag+"_"+str(global_step), h, w)
+
                 x_tgt = rearrange(x_tgt, 'b v c h w -> (b v) c h w')
                 x_tgt_pred = rearrange(x_tgt_pred, 'b v c h w -> (b v) c h w')
                          
