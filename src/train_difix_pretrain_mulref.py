@@ -171,6 +171,13 @@ def load_pipe_weights_into_model(pipe, model, report: bool = True):
     def load_component(dst_module, src_module, name):
         dst_sd = dst_module.state_dict()
         src_sd = src_module.state_dict()
+
+        # filter out mismatched shapes
+        src_sd = {
+            k: v for k, v in src_sd.items()
+            if k in dst_sd and v.shape == dst_sd[k].shape
+        }
+
         missing, unexpected = dst_module.load_state_dict(src_sd, strict=False)
         results[name] = {"missing": missing, "unexpected": unexpected}
 
@@ -404,7 +411,7 @@ def main(args):
                 else:
                     loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
                     loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
-                loss = loss_l2 + loss_lpips
+                loss = loss_l2 #+ loss_lpips
                 
                 # Gram matrix loss
                 if args.lambda_gram > 0:
@@ -420,7 +427,7 @@ def main(args):
                                 x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
                         
                                 loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                                loss += loss_gram
+                                #loss += loss_gram
                             else:
                                 x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred[::2] * 0.5 + 0.5)
                                 crop_h, crop_w = 400, 400
@@ -431,7 +438,7 @@ def main(args):
                                 x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
                         
                                 loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                                loss += loss_gram
+                                #loss += loss_gram
                         else:
                             x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
                             crop_h, crop_w = 400, 400
@@ -442,7 +449,7 @@ def main(args):
                             x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
                         
                             loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                            loss += loss_gram
+                            #loss += loss_gram
                     else:
                         loss_gram = torch.tensor(0.0).to(weight_dtype)                    
 

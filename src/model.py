@@ -104,9 +104,14 @@ def load_ckpt_from_state_dict(net_difix, optimizer, pretrained_path):
 def save_ckpt(net_difix, optimizer, outf):
     sd = {}
     sd["vae_lora_target_modules"] = net_difix.target_modules_vae
+    
+    #sd["unet_lora_target_modules"] = net_difix.target_modules_unet
+    
     sd["rank_vae"] = net_difix.lora_rank_vae
     sd["state_dict_unet"] = net_difix.unet.state_dict()
     sd["state_dict_vae"] = {k: v for k, v in net_difix.vae.state_dict().items() if "lora" in k or "skip" in k}
+
+    #sd["state_dict_unet"] = {k: v for k, v in net_difix.unet.state_dict().items() if "lora" in k or "conv_in" in k}
     
     sd["optimizer"] = optimizer.state_dict()   
     
@@ -163,12 +168,21 @@ class Difix(torch.nn.Module):
                 "to_k", "to_q", "to_v", "to_out.0",
             ]
             
+            
+            lora_vae_encoder = False
             target_modules = []
+            # TODO: MAYBE WE CAN JUST FOLLOW PIX2PIX
             for id, (name, param) in enumerate(vae.named_modules()):
-                if 'decoder' in name and any(name.endswith(x) for x in target_modules_vae):
-                    target_modules.append(name)
+                if not lora_vae_encoder:
+                    if 'decoder' in name and any(name.endswith(x) for x in target_modules_vae):
+                        target_modules.append(name)
+                else:
+                    if ('encoder' in name or 'decoder' in name) and any(name.endswith(x) for x in target_modules_vae):
+                        target_modules.append(name)
+
             target_modules_vae = target_modules
-            vae.encoder.requires_grad_(False)
+            if not lora_vae_encoder:
+                vae.encoder.requires_grad_(False)
 
             vae_lora_config = LoraConfig(r=lora_rank_vae, init_lora_weights="gaussian",
                 target_modules=target_modules_vae)
@@ -176,6 +190,22 @@ class Difix(torch.nn.Module):
                 
             self.lora_rank_vae = lora_rank_vae
             self.target_modules_vae = target_modules_vae
+
+            #lora_unet = True
+            # unet lora
+            #target_modules_unet = []
+            #if lora_unet:
+            #    # unet lora
+            #    target_modules_unet = [
+            #        "to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2", "conv_shortcut", "conv_out",
+            #        "proj_in", "proj_out", "ff.net.2", "ff.net.0.proj"
+            #    ]
+            #    unet_lora_config = LoraConfig(r=lora_rank_vae, init_lora_weights="gaussian",
+            #        target_modules=target_modules_unet)
+            #    unet.add_adapter(unet_lora_config, adapter_name="unet_skip")
+            #    # same rank
+            #    self.lora_rank_unet = lora_rank_vae
+            #    self.target_modules_unet = target_modules_unet
 
         # unet.enable_xformers_memory_efficient_attention()
         unet.to("cuda")
@@ -206,6 +236,7 @@ class Difix(torch.nn.Module):
         for n, _p in self.vae.named_parameters():
             if "lora" in n:
                 _p.requires_grad = True
+
         self.vae.decoder.skip_conv_1.requires_grad_(True)
         self.vae.decoder.skip_conv_2.requires_grad_(True)
         self.vae.decoder.skip_conv_3.requires_grad_(True)
@@ -258,7 +289,7 @@ class Difix(torch.nn.Module):
             x = torch.stack([T(image), T(ref_image)], dim=0).unsqueeze(0).cuda()
         
         output_image = self.forward(x, timesteps, prompt, prompt_tokens)[:, 0]
-        output_pil = transforms.ToPILImage()(output_image[0].cpu() * 0.5 + 0.5)
+        output_pil = transforms.ToPILImage()(torch.clamp(output_image[0].cpu(), -1.0, 1.0) * 0.5 + 0.5)
         output_pil = output_pil.resize((input_width, input_height), Image.LANCZOS)
         
         return output_pil
