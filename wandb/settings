@@ -1,0 +1,5 @@
+[default]
+entity = johnnylu
+project = DifixSLS
+base_url = https://api.wandb.ai
+

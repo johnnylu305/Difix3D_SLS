@@ -299,9 +299,9 @@ def main(args):
         num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles, power=args.lr_power,)
 
-    dataset_train = PairedDatasetCus(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv, useRender=args.useRender, stich=args.stich)
+    dataset_train = PairedDatasetCus(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv, useRender=args.useRender, stich=args.stich, select=args.select)
     dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    dataset_val = PairedDatasetCus(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv, useRender=args.useRender, stich=args.stich)
+    dataset_val = PairedDatasetCus(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv, useRender=args.useRender, stich=args.stich, select=args.select)
     random.Random(42).shuffle(dataset_val.img_ids)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
@@ -522,11 +522,13 @@ def main(args):
                         outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
                         # accelerator.unwrap_model(net_difix).save_model(outf)
                         save_ckpt(accelerator.unwrap_model(net_difix), optimizer, outf)
-
+                    
                     # compute validation set L2, LPIPS
                     if args.eval_freq > 0 and global_step % args.eval_freq == 1:
                         l_l2, l_lpips = [], []
-                        log_dict = {"sample/source": [], "sample/target": [], "sample/model_output": []}
+                        #log_dict = {"sample/source": [], "sample/target": [], "sample/model_output": [], "sample/results": []}
+                        log_dict = {"sample/results": []}
+                        seen = {}
                         for step, batch_val in enumerate(dl_val):
                             if step >= args.num_samples_eval:
                                 break
@@ -538,7 +540,12 @@ def main(args):
                                 # forward pass
                                 x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
                                 
-                                if step % 10 == 0:
+                                if batch_val["scene_id"][0] not in seen:
+                                    seen[batch_val["scene_id"][0]] = 0
+
+                                if seen[batch_val["scene_id"][0]] < 5:
+                                    seen[batch_val["scene_id"][0]] += 1
+                                #if step % 2 == 0: #10 == 0:
                                     #log_dict["sample/source"].append(wandb.Image(to_uint8(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
                                     #log_dict["sample/target"].append(wandb.Image(to_uint8(rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
                                     #log_dict["sample/model_output"].append(wandb.Image(to_uint8(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
@@ -577,15 +584,18 @@ def main(args):
                                         # 2×3 grid
                                         grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
  
-                                    log_dict = {
-                                        "sample/results": [wandb.Image(to_uint8(rearrange(grid, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
-                                    }
-
+                                    log_dict["sample/results"].append(wandb.Image(to_uint8(rearrange(grid, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/results'])}"))
+                                # b v c h w -> b c h w
                                 x_tgt = x_tgt[:, 0] # take the input view
                                 x_tgt_pred = x_tgt_pred[:, 0] # take the input view
                                 # compute the reconstruction losses
-                                loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
-                                loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
+                                if args.stich:
+                                    b, c, h, w = x_tgt_pred.shape
+                                    loss_l2 = F.mse_loss(x_tgt_pred[...,:w//2].float(), x_tgt[...,:w//2].float(), reduction="mean")
+                                    loss_lpips = net_lpips(x_tgt_pred[...,:w//2].float(), x_tgt[...,:w//2].float()).mean()
+                                else:
+                                    loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
+                                    loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
 
                                 l_l2.append(loss_l2.item())
                                 l_lpips.append(loss_lpips.item())
@@ -616,10 +626,10 @@ if __name__ == "__main__":
 
     # validation eval args
     parser.add_argument("--eval_freq", default=100, type=int)
-    parser.add_argument("--num_samples_eval", type=int, default=100, help="Number of samples to use for all evaluation")
+    parser.add_argument("--num_samples_eval", type=int, default=200, help="Number of samples to use for all evaluation")
 
     parser.add_argument("--viz_freq", type=int, default=100, help="Frequency of visualizing the outputs.")
-    parser.add_argument("--tracker_project_name", type=str, default="difix", help="The name of the wandb project to log to.")
+    parser.add_argument("--tracker_project_name", type=str, default="johnnylu/DifixSLS", help="The name of the wandb project to log to.")
     parser.add_argument("--tracker_run_name", type=str, required=True)
 
     # details about the model architecture
@@ -684,6 +694,7 @@ if __name__ == "__main__":
     parser.add_argument("--useRender", action="store_true")
 
     parser.add_argument("--stich", action="store_true")
+    parser.add_argument("--select", action="store_true")
 
     # resume
     parser.add_argument("--resume", default=None, type=str)

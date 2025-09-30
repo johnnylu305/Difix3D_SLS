@@ -113,12 +113,17 @@ class PairedDataset(torch.utils.data.Dataset):
         return out
 
 class PairedDatasetCus(torch.utils.data.Dataset):
-    def __init__(self, dataset_path, split, height=512, width=512, tokenizer=None, mulref=False, nv=1, useRender=False, stich=False):
+    def __init__(self, dataset_path, split, height=512, width=512, tokenizer=None, mulref=False, nv=1, useRender=False, stich=False, select=False):
     #def __init__(self, dataset_path, split, height=576, width=1024, tokenizer=None):
 
         super().__init__()
         with open(dataset_path, "r") as f:
             self.data = json.load(f)[split]
+        if split == "train" and select:
+            ks = list(self.data.keys())
+            for k in ks:
+                if self.data[k]["lpips"] > 0.6:
+                    del self.data[k]
         self.img_ids = list(self.data.keys())
         self.image_size = (height, width)
         self.tokenizer = tokenizer
@@ -127,6 +132,7 @@ class PairedDatasetCus(torch.utils.data.Dataset):
         self.nv = nv
         self.useRender = useRender
         self.stich = stich
+        self.select = select
 
     def __len__(self):
 
@@ -258,6 +264,7 @@ class PairedDatasetCus(torch.utils.data.Dataset):
             "output_pixel_values": output_t,
             "conditioning_pixel_values": img_t,
             "caption": caption,
+            "scene_id": scene_id
         }
         
         if self.tokenizer is not None:
