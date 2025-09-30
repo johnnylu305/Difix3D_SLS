@@ -163,9 +163,9 @@ def main(args):
         num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles, power=args.lr_power,)
 
-    dataset_train = PairedDatasetCus(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer)
+    dataset_train = PairedDatasetCus(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer, useRender=args.useRender)
     dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    dataset_val = PairedDatasetCus(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer)
+    dataset_val = PairedDatasetCus(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer, useRender=args.useRender)
     random.Random(42).shuffle(dataset_val.img_ids)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
@@ -243,23 +243,39 @@ def main(args):
                 x_tgt_pred = rearrange(x_tgt_pred, 'b v c h w -> (b v) c h w')
                          
                 # Reconstruction loss
-                loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
-                loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
+                if args.useRender:
+                    loss_l2 = F.mse_loss(x_tgt_pred[::2].float(), x_tgt[::2].float(), reduction="mean") * args.lambda_l2
+                    loss_lpips = net_lpips(x_tgt_pred[::2].float(), x_tgt[::2].float()).mean() * args.lambda_lpips
+                else:
+                    loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
+                    loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
                 loss = loss_l2 + loss_lpips
                 
                 # Gram matrix loss
                 if args.lambda_gram > 0:
                     if global_step > args.gram_loss_warmup_steps:
-                        x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
-                        crop_h, crop_w = 400, 400
-                        top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
-                        x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
-                        
-                        x_tgt_renorm = t_vgg_renorm(x_tgt * 0.5 + 0.5)
-                        x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
-                        
-                        loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                        loss += loss_gram
+                        if args.useRender:
+                            x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred[::2] * 0.5 + 0.5)
+                            crop_h, crop_w = 400, 400
+                            top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
+                            x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
+                            
+                            x_tgt_renorm = t_vgg_renorm(x_tgt[::2] * 0.5 + 0.5)
+                            x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
+                            
+                            loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
+                            loss += loss_gram
+                        else:
+                            x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
+                            crop_h, crop_w = 400, 400
+                            top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
+                            x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
+                            
+                            x_tgt_renorm = t_vgg_renorm(x_tgt * 0.5 + 0.5)
+                            x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
+                            
+                            loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
+                            loss += loss_gram
                     else:
                         loss_gram = torch.tensor(0.0).to(weight_dtype)                    
 
@@ -419,6 +435,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers.")
     parser.add_argument("--set_grads_to_none", action="store_true",)
     
+    parser.add_argument("--useRender", action="store_true")
+
     # resume
     parser.add_argument("--resume", default=None, type=str)
 

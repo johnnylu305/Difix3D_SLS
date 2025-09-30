@@ -299,9 +299,9 @@ def main(args):
         num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles, power=args.lr_power,)
 
-    dataset_train = PairedDatasetCus(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv)
+    dataset_train = PairedDatasetCus(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv, useRender=args.useRender, stich=args.stich)
     dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    dataset_val = PairedDatasetCus(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv)
+    dataset_val = PairedDatasetCus(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv, useRender=args.useRender, stich=args.stich)
     random.Random(42).shuffle(dataset_val.img_ids)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
@@ -388,23 +388,61 @@ def main(args):
                 x_tgt_pred = rearrange(x_tgt_pred, 'b v c h w -> (b v) c h w')
                          
                 # Reconstruction loss
-                loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
-                loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
+                # x_tgt: (bv) c h w 
+                #x_tgt_nonref = x_tgt[::2]
+                #plt.imshow(np.transpose(np.array(x_tgt_nonref[0].detach().cpu()), (1, 2, 0)))
+                #plt.imshow(np.transpose(np.array(x_tgt_nonref[1].detach().cpu()), (1, 2, 0)))
+                #plt.show()
+                if args.useRender:
+                    if args.stich:
+                        b, c, h, w = x_tgt_pred.shape
+                        loss_l2 = F.mse_loss(x_tgt_pred[...,:w//2].float(), x_tgt[...,:w//2].float(), reduction="mean") * args.lambda_l2
+                        loss_lpips = net_lpips(x_tgt_pred[...,:w//2].float(), x_tgt[...,:w//2].float()).mean() * args.lambda_lpips
+                    else:
+                        loss_l2 = F.mse_loss(x_tgt_pred[::2].float(), x_tgt[::2].float(), reduction="mean") * args.lambda_l2
+                        loss_lpips = net_lpips(x_tgt_pred[::2].float(), x_tgt[::2].float()).mean() * args.lambda_lpips
+                else:
+                    loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
+                    loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
                 loss = loss_l2 + loss_lpips
                 
                 # Gram matrix loss
                 if args.lambda_gram > 0:
                     if global_step > args.gram_loss_warmup_steps:
-                        x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
-                        crop_h, crop_w = 400, 400
-                        top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
-                        x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
+                        if args.useRender:
+                            if args.stich:
+                                x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred[...,:w//2] * 0.5 + 0.5)
+                                crop_h, crop_w = 400, 400
+                                top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
+                                x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
                         
-                        x_tgt_renorm = t_vgg_renorm(x_tgt * 0.5 + 0.5)
-                        x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
+                                x_tgt_renorm = t_vgg_renorm(x_tgt[...,:w//2] * 0.5 + 0.5)
+                                x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
                         
-                        loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                        loss += loss_gram
+                                loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
+                                loss += loss_gram
+                            else:
+                                x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred[::2] * 0.5 + 0.5)
+                                crop_h, crop_w = 400, 400
+                                top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
+                                x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
+                        
+                                x_tgt_renorm = t_vgg_renorm(x_tgt[::2] * 0.5 + 0.5)
+                                x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
+                        
+                                loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
+                                loss += loss_gram
+                        else:
+                            x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
+                            crop_h, crop_w = 400, 400
+                            top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
+                            x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
+                        
+                            x_tgt_renorm = t_vgg_renorm(x_tgt * 0.5 + 0.5)
+                            x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
+                        
+                            loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
+                            loss += loss_gram
                     else:
                         loss_gram = torch.tensor(0.0).to(weight_dtype)                    
 
@@ -434,10 +472,47 @@ def main(args):
 
                     # viz some images
                     if global_step % args.viz_freq == 1:
+                        #log_dict = {
+                        #    "train/source": [wandb.Image(to_uint8(rearrange(x_src, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
+                        #    "train/target": [wandb.Image(to_uint8(rearrange(x_tgt, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
+                        #    "train/model_output": [wandb.Image(to_uint8(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
+                        #}
+                        if args.stich:
+                            # b v c h w
+                            # src_tar | src | src_output 
+                            #         | ref | ref_output
+                            b, v, c, h, w = x_src.shape
+                            w2 = w // 2
+                            # split halves
+                            src, ref = x_src[..., :w2], x_src[..., w2:]
+                            src_tar = x_tgt[..., :w2]
+                            src_output, ref_output = x_tgt_pred[..., :w2], x_tgt_pred[..., w2:]
+
+                            # row1: src_tar | src | src_output
+                            row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
+                            # row2: blank | ref | ref_output
+                            blank = -torch.ones_like(ref)
+                            row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
+                            # 2×3 grid
+                            grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
+                        else:
+                            # b v c h w
+                            # src_tar | src | src_output 
+                            #         | ref | ref_output
+                            b, v, c, h, w = x_src.shape
+                            # split halves
+                            src, ref = x_src[:, 0:1, :, :, :], x_src[:, 1:2, :, :, :]
+                            src_tar = x_tgt[:, 0:1, :, :, :]
+                            src_output, ref_output = x_tgt_pred[:, 0:1, :, :, :], x_tgt_pred[:, 1:2, :, :, :]
+                            # row1: src_tar | src | src_output
+                            row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
+                            # row2: blank | ref | ref_output
+                            blank = -torch.ones_like(ref)
+                            row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
+                            # 2×3 grid
+                            grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
                         log_dict = {
-                            "train/source": [wandb.Image(to_uint8(rearrange(x_src, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
-                            "train/target": [wandb.Image(to_uint8(rearrange(x_tgt, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
-                            "train/model_output": [wandb.Image(to_uint8(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
+                            "train/results": [wandb.Image(to_uint8(rearrange(grid, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
                         }
                         for k in log_dict:
                             logs[k] = log_dict[k]
@@ -464,10 +539,48 @@ def main(args):
                                 x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
                                 
                                 if step % 10 == 0:
-                                    log_dict["sample/source"].append(wandb.Image(to_uint8(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
-                                    log_dict["sample/target"].append(wandb.Image(to_uint8(rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
-                                    log_dict["sample/model_output"].append(wandb.Image(to_uint8(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
-                                
+                                    #log_dict["sample/source"].append(wandb.Image(to_uint8(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
+                                    #log_dict["sample/target"].append(wandb.Image(to_uint8(rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
+                                    #log_dict["sample/model_output"].append(wandb.Image(to_uint8(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
+                                    if args.stich:
+                                        # b v c h w
+                                        # src_tar | src | src_output 
+                                        #         | ref | ref_output
+                                        b, v, c, h, w = x_src.shape
+                                        w2 = w // 2
+                                        # split halves
+                                        src, ref = x_src[..., :w2], x_src[..., w2:]
+                                        src_tar = x_tgt[..., :w2]
+                                        src_output, ref_output = x_tgt_pred[..., :w2], x_tgt_pred[..., w2:]
+
+                                        # row1: src_tar | src | src_output
+                                        row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
+                                        # row2: blank | ref | ref_output
+                                        blank = -torch.ones_like(ref)
+                                        row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
+                                        # 2×3 grid
+                                        grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
+                                    else:
+                                        # b v c h w
+                                        # src_tar | src | src_output 
+                                        #         | ref | ref_output
+                                        b, v, c, h, w = x_src.shape
+                                        # split halves
+                                        src, ref = x_src[:, 0:1, :, :, :], x_src[:, 1:2, :, :, :]
+                                        src_tar = x_tgt[:, 0:1, :, :, :]
+                                        src_output, ref_output = x_tgt_pred[:, 0:1, :, :, :], x_tgt_pred[:, 1:2, :, :, :]
+                                        # row1: src_tar | src | src_output
+                                        row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
+                                        # row2: blank | ref | ref_output
+                                        blank = -torch.ones_like(ref)
+                                        row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
+                                        # 2×3 grid
+                                        grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
+ 
+                                    log_dict = {
+                                        "sample/results": [wandb.Image(to_uint8(rearrange(grid, "b v c h w -> b c (v h) w")[idx].float().detach().cpu()), caption=f"idx={idx}") for idx in range(B)],
+                                    }
+
                                 x_tgt = x_tgt[:, 0] # take the input view
                                 x_tgt_pred = x_tgt_pred[:, 0] # take the input view
                                 # compute the reconstruction losses
@@ -567,7 +680,11 @@ if __name__ == "__main__":
     parser.add_argument("--nv", type=int, default=1,
         help="Number of reference view",
     )
-   
+
+    parser.add_argument("--useRender", action="store_true")
+
+    parser.add_argument("--stich", action="store_true")
+
     # resume
     parser.add_argument("--resume", default=None, type=str)
 

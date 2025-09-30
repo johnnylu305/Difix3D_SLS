@@ -113,7 +113,7 @@ class PairedDataset(torch.utils.data.Dataset):
         return out
 
 class PairedDatasetCus(torch.utils.data.Dataset):
-    def __init__(self, dataset_path, split, height=512, width=512, tokenizer=None, mulref=False, nv=1):
+    def __init__(self, dataset_path, split, height=512, width=512, tokenizer=None, mulref=False, nv=1, useRender=False, stich=False):
     #def __init__(self, dataset_path, split, height=576, width=1024, tokenizer=None):
 
         super().__init__()
@@ -125,6 +125,8 @@ class PairedDatasetCus(torch.utils.data.Dataset):
         self.img_ids_sorted = sorted(self.img_ids)
         self.mulref = mulref
         self.nv = nv
+        self.useRender = useRender
+        self.stich = stich
 
     def __len__(self):
 
@@ -177,7 +179,11 @@ class PairedDatasetCus(torch.utils.data.Dataset):
             use_neighbor = neighbor_id is not None and neighbor_id.split("_val_")[0] == scene_id
 
             if use_neighbor:
-                ref_img = "/".join(parts[:-1] + [neighbor_id + "_target.png"])
+                if self.useRender:
+                    ref_name = "_source.png"
+                else:
+                    ref_name = "_target.png"
+                ref_img = "/".join(parts[:-1] + [neighbor_id + ref_name])
                 ref_t = Image.open(ref_img)
                 ref_t = F.to_tensor(ref_t)
                 ref_t, _, _ = pad_and_crop(ref_t, self.image_size)
@@ -204,9 +210,15 @@ class PairedDatasetCus(torch.utils.data.Dataset):
             # --- step 4: load chosen refs, convert to tensor, batch process ---
             loaded = []
             for nid in chosen_ids:
-                path = self.data[img_id]["target_image"]
+                if self.useRender:
+                    ref_key = "image"
+                    ref_name = "_source.png"
+                else:
+                    ref_key = "target_image"
+                    ref_name = "_target.png"
+                path = self.data[img_id][ref_key]
                 parts = path.split("/")
-                ref_img = "/".join(parts[:-1] + [nid + "_target.png"])
+                ref_img = "/".join(parts[:-1] + [nid + ref_name])
                 loaded.append(Image.open(ref_img))
 
             if loaded:
@@ -234,8 +246,13 @@ class PairedDatasetCus(torch.utils.data.Dataset):
                 rows.append(row)
             ref_t = torch.cat(rows, dim=1)                     # concat rows along height
         
-        img_t = torch.stack([img_t, ref_t], dim=0)
-        output_t = torch.stack([output_t, ref_t], dim=0)
+        if self.stich:
+            # Side-by-side stitching, keep batch dimension
+            img_t    = torch.cat([img_t, ref_t], dim=-1).unsqueeze(0)       # (1, C, H, W*2)
+            output_t = torch.cat([output_t, ref_t], dim=-1).unsqueeze(0)    # (1, C, H, W*2)
+        else:
+            img_t = torch.stack([img_t, ref_t], dim=0)
+            output_t = torch.stack([output_t, ref_t], dim=0)
 
         out = {
             "output_pixel_values": output_t,
