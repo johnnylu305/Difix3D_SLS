@@ -345,10 +345,12 @@ def main(args):
         if "lora" in n and "vae_skip" in n:
             assert _p.requires_grad
             layers_to_opt.append(_p)
+            print(n)
     layers_to_opt = layers_to_opt + list(net_difix.vae.decoder.skip_conv_1.parameters()) + \
         list(net_difix.vae.decoder.skip_conv_2.parameters()) + \
         list(net_difix.vae.decoder.skip_conv_3.parameters()) + \
         list(net_difix.vae.decoder.skip_conv_4.parameters())
+
 
     optimizer = torch.optim.AdamW(layers_to_opt, lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
@@ -895,7 +897,7 @@ if __name__ == "__main__":
     parser.add_argument("--revision", type=str, default=None,)
     parser.add_argument("--variant", type=str, default=None,)
     parser.add_argument("--tokenizer_name", type=str, default=None)
-    parser.add_argument("--lora_rank_vae", default=4, type=int)
+    parser.add_argument("--lora_rank_vae", default=4, type=int) # 4
     parser.add_argument("--timestep", default=199, type=int)
     parser.add_argument("--mv_unet", action="store_true")
 
@@ -926,7 +928,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataloader_num_workers", type=int, default=0,)
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
+    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.") # 1e-2
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument("--allow_tf32", action="store_true",
