@@ -29,55 +29,106 @@ from dataset import PairedDatasetCus
 from loss import gram_loss
 from pipeline_difix import DifixPipeline
 
+from pytorch_msssim import ssim
 import math
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
+import cv2
 os.makedirs("./output_att", exist_ok=True)
 # will hold the three processors so we can read their .last_attn_probs after a forward
-REC_PROCS = {"down": None} #, "mid": None, "up": None}
-ATT_HW = {"down": (128, 64)} #, "mid": , "up": None}
+REC_PROCS = {"down": None, "mid": None, "up": None}
+ATT_HW = {"down": (64, 128), "mid": (8, 16), "up": (64, 128)}
 
-def save_avg_attn_map(avg_vec: torch.Tensor, name: str, h: int, w: int, outdir="./output_att"):
+def charbonnier_loss(pred, target, epsilon=1e-6):
+    diff = pred - target
+    return torch.mean(torch.sqrt(diff * diff + epsilon**2))
+
+
+def save_avg_attn_map(
+    avg_vec: torch.Tensor,     # [B, K], where K = att_h*att_w or M*att_h*att_w
+    img: torch.Tensor,         # [B, 1, C, H, W], values in [-1, 1]
+    name: str,
+    att_h: int, att_w: int,    # attention native resolution
+    outdir: str = "./output_att",
+    alpha: float = 0.45,       # overlay opacity
+):
     os.makedirs(outdir, exist_ok=True)
 
-    # ---- sanitize tensor ----
-    if not isinstance(avg_vec, torch.Tensor):
-        raise TypeError(f"avg_vec must be a torch.Tensor, got {type(avg_vec)}")
-    vec = avg_vec.detach().to(torch.float32).cpu()
-    if vec.ndim == 2:
-        vec = vec[0]  # take first in batch
-    elif vec.ndim != 1:
-        raise ValueError(f"avg_vec must be 1D or 2D, got shape {tuple(avg_vec.shape)}")
+    # ---- Sanity ----
+    if not (isinstance(avg_vec, torch.Tensor) and isinstance(img, torch.Tensor)):
+        raise TypeError("avg_vec and img must be torch.Tensors")
+    if avg_vec.ndim != 2:
+        raise ValueError(f"avg_vec must be [B,K], got {tuple(avg_vec.shape)}")
+    if img.ndim != 5 or img.shape[1] != 1:
+        raise ValueError(f"img must be [B,1,C,H,W], got {tuple(img.shape)}")
 
-    K = vec.numel()
-    hw = h * w
+    vec = avg_vec#.detach().to(torch.float32).cpu()   # [B,K]
+    im  = img.detach().to(torch.float32).cpu()       # [B,1,C,H,W]
 
-    # ---- reshape: single-view or multi-view ----
-    if K == hw:
-        att_map = vec.view(h, w)
-    elif K % hw == 0:
-        V = K // hw
-        # average across views if multiple are concatenated
-        maps = []
-        for v in range(V):
-            start, end = v * hw, (v + 1) * hw
-            maps.append(vec[start:end].view(h, w))
-        att_map = torch.stack(maps, dim=0).mean(dim=0)
-    else:
-        raise ValueError(f"Cannot reshape K={K} into ({h}x{w}) or its multiples.")
+    B, K = vec.shape
+    Bb, V, C, H, W = im.shape
+    if B != Bb:
+        raise ValueError(f"Batch mismatch: avg_vec B={B}, img B={Bb}")
+    if V != 1:
+        raise ValueError(f"Expected V=1, got V={V}")
 
-    # ---- normalize to [0,1] for visualization ----
-    amin = float(att_map.min())
-    amax = float(att_map.max())
-    att_vis = (att_map - amin) / (amax - amin + 1e-8)
+    att_hw = att_h * att_w
+    if (K != att_hw) and (K % att_hw != 0):
+        raise ValueError(f"K={K} not compatible with att_h*att_w={att_hw}")
 
-    # ---- save (no title, no axis, no colorbar, no whitespace) ----
-    plt.imshow(att_vis.numpy(), cmap="jet", interpolation="nearest")
-    plt.axis("off")
-    out_path = os.path.join(outdir, f"{name}_avg.png")
-    plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
-    plt.close()
+    # [-1,1] -> [0,255] uint8 (RGB), then BGR for OpenCV
+    def chw_to_bgr_u8(tCHW: torch.Tensor) -> np.ndarray:
+        t = tCHW
+        if t.shape[0] == 1:
+            t = t.repeat(3, 1, 1)
+        elif t.shape[0] > 3:
+            t = t[:3]
+        t01 = (t * 0.5 + 0.5).clamp(0, 1)
+        rgb = (t01.numpy() * 255.0).astype(np.uint8).transpose(1, 2, 0)  # HWC
+        return rgb[..., ::-1]  # RGB->BGR
 
-    print(f"[save_avg_attn_map] saved: {out_path}")
+    for b in range(B):
+        # Build native attention [1,1,att_h,att_w]
+        if K == att_hw:
+            att_native = vec[b].view(1, 1, att_h, att_w)
+        else:
+            M = K // att_hw
+            chunks = [vec[b, m*att_hw:(m+1)*att_hw].view(1,1,att_h,att_w) for m in range(M)]
+            att_native = torch.mean(torch.stack(chunks, 0), dim=0)
+
+        # Upsample to (H,W)
+        att_up = F.interpolate(att_native, size=(H, W), mode="bilinear", align_corners=False)[0,0]  # [H,W]
+
+        # Normalize to [0,1]
+        a_min, a_max = float(att_up.min()), float(att_up.max())
+        att01 = (att_up - a_min) / (a_max - a_min + 1e-8)
+
+        # Colorize -> heatmap
+        att_u8   = (att01.numpy() * 255.0).astype(np.uint8)         # [H,W]
+        heat_bgr = cv2.applyColorMap(att_u8, cv2.COLORMAP_JET)      # [H,W,3] uint8
+
+        # Save heatmap
+        #heat_path = os.path.join(outdir, f"{name}_b{b}_heat.png")
+        #cv2.imwrite(heat_path, heat_bgr)
+
+        # Overlay with image (use view v=0)
+        img_bgr = chw_to_bgr_u8(im[b, 0])                           # [H,W,3] uint8 (BGR)
+        over    = cv2.addWeighted(img_bgr, 1.0 - alpha, heat_bgr, alpha, 0.0)
+
+        #over_path = os.path.join(outdir, f"{name}_b{b}_overlay.png")
+        #cv2.imwrite(over_path, over)
+
+        #img_path = os.path.join(outdir, f"{name}_b{b}_img.png")
+        #cv2.imwrite(img_path, img_bgr)
+
+        #print(f"[attn] saved {heat_path} and {over_path}")
+
+        # Simple vertical stack: [original; heatmap; overlay]
+        combined = np.vstack([heat_bgr, img_bgr, over])        # [3H, W, 3]
+
+        stack_path = os.path.join(outdir, f"{name}_b{b}_stack.png")
+        cv2.imwrite(stack_path, combined)
+        print(f"[attn] saved {stack_path}")
+
 
 class RecordingAttnProcessor:
     """
@@ -123,12 +174,12 @@ class RecordingAttnProcessor:
         probs = torch.softmax(scores.float(), dim=-1).to(scores.dtype)  # [B,H,Q,K]
         # ex: Q = H//8 x W//8
         # ex: K = H//8 x W//8
-        self.last_attn_probs = probs.detach()
+        #self.last_attn_probs = probs.detach()
 
         # === Average attention map ===
         # mean over heads and over queries -> [B, K]
         avg_attn_vec = probs.mean((1, 2))          # [B, K]
-        self.avg_attn_vec = avg_attn_vec.detach().to(torch.float32)
+        self.avg_attn_vec = avg_attn_vec.detach().to(torch.float32).cpu() #.to(torch.float32)
         #print("h", torch.unique(hidden_states))
         #print("q", torch.unique(q))
         #print("k", torch.unique(k))
@@ -243,20 +294,21 @@ def main(args):
     unet_ref = net_difix.unet  # keep a non-wrapped reference for name matching (before accelerator.prepare)
     down_set = mid_set = up_set = False
     for name, module in unet_ref.named_modules():
-        if hasattr(module, "attn1"):
-            if (not down_set) and ("down_blocks.0" in name):
+        if hasattr(module, "attn1"): #1"):
+            #print(name, module)
+            if (not down_set) and ("down_blocks.0.attentions.1.transformer_blocks.0" in name):
                 REC_PROCS["down"] = RecordingAttnProcessor("down")
                 module.attn1.set_processor(REC_PROCS["down"])
                 down_set = True
-            elif (not mid_set) and ("mid_block" in name):
+            elif (not mid_set) and ("mid_block.attentions.0.transformer_blocks.0" in name):
                 REC_PROCS["mid"] = RecordingAttnProcessor("mid")
                 module.attn1.set_processor(REC_PROCS["mid"])
                 mid_set = True
-            elif (not up_set) and ("up_blocks.0" in name):
+            elif (not up_set) and ("up_blocks.3.attentions.2.transformer_blocks.0" in name):
                 REC_PROCS["up"] = RecordingAttnProcessor("up")
                 module.attn1.set_processor(REC_PROCS["up"])
                 up_set = True
-
+    
     # Original difix
     pipe = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
     pipe.to("cuda")
@@ -367,8 +419,166 @@ def main(args):
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
 
-    progress_bar = tqdm(range(0, args.max_train_steps), initial=global_step, desc="Steps",
-        disable=not accelerator.is_local_main_process,)
+        progress_bar = tqdm(range(0, args.max_train_steps), initial=global_step, desc="Steps",
+            disable=not accelerator.is_local_main_process,)
+
+
+    # compute validation set L2, LPIPS
+    initial_val = True
+    if initial_val and accelerator.is_main_process:
+        logs = {}
+        l_l2, l_lpips, src_l_l2, src_l_lpips = [], [], [], []
+        l_psnr, src_l_psnr = [], []
+        #log_dict = {"sample/source": [], "sample/target": [], "sample/model_output": [], "sample/results": []}
+        log_dict = {"sample/results": []}
+        seen = {}
+        for step, batch_val in enumerate(dl_val):
+            #print(step)
+            if step >= args.num_samples_eval:
+                break
+            x_src = batch_val["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+            x_tgt = batch_val["output_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+            nopad_mask = batch_val["nopad_mask"].to(accelerator.device, dtype=weight_dtype)
+            B, V, C, H, W = x_src.shape
+            assert B == 1, "Use batch size 1 for eval."
+            with torch.no_grad():
+                # forward pass
+                x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
+                
+                if batch_val["scene_id"][0] not in seen:
+                    seen[batch_val["scene_id"][0]] = 0
+
+                scene_flag = True
+                for s in ["crab", "yoda", "android", "patio_first", "statue", "mountain", "corner"]:
+                    if s in batch_val["scene_id"][0]:
+                        scene_flag = False
+
+                if step>250 and scene_flag and seen[batch_val["scene_id"][0]] < 12:
+                    seen[batch_val["scene_id"][0]] += 1
+                #if step % 2 == 0: #10 == 0:
+                    #log_dict["sample/source"].append(wandb.Image(to_uint8(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
+                    #log_dict["sample/target"].append(wandb.Image(to_uint8(rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
+                    #log_dict["sample/model_output"].append(wandb.Image(to_uint8(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
+                    if args.stich:
+                        # b v c h w
+                        # src_tar | src | src_output 
+                        #         | ref | ref_output
+                        b, v, c, h, w = x_src.shape
+                        w2 = w // 2
+                        # split halves
+                        src, ref = x_src[..., :w2], x_src[..., w2:]
+                        src_tar = x_tgt[..., :w2]
+                        src_output, ref_output = x_tgt_pred[..., :w2], x_tgt_pred[..., w2:]
+
+                        # row1: src_tar | src | src_output
+                        row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
+                        # row2: blank | ref | ref_output
+                        blank = -torch.ones_like(ref)
+                        row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
+                        # 2×3 grid
+                        grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
+                    else:
+                        # b v c h w
+                        # src_tar | src | src_output 
+                        #         | ref | ref_output
+                        b, v, c, h, w = x_src.shape
+                        # split halves
+                        src, ref = x_src[:, 0:1, :, :, :], x_src[:, 1:2, :, :, :]
+                        src_tar = x_tgt[:, 0:1, :, :, :]
+                        src_output, ref_output = x_tgt_pred[:, 0:1, :, :, :], x_tgt_pred[:, 1:2, :, :, :]
+                        # row1: src_tar | src | src_output
+                        row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
+                        # row2: blank | ref | ref_output
+                        blank = -torch.ones_like(ref)
+                        row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
+                        # 2×3 grid
+                        grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
+
+                    log_dict["sample/results"].append(wandb.Image(to_uint8(rearrange(grid, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/results'])}"))
+                # b v c h w -> b c h w
+                x_tgt = x_tgt[:, 0] # take the input view
+                x_tgt_pred = x_tgt_pred[:, 0] # take the input view
+                x_src = x_src[:, 0]
+                # compute the reconstruction losses
+                ys, xs = torch.where(nopad_mask[0, 0, 0, :, :])
+                y0, y1 = ys.min().item(), ys.max().item() + 1
+                x0, x1 = xs.min().item(), xs.max().item() + 1
+                #plt.imshow(np.transpose(to_uint8(x_tgt_pred[...,:w//2][...,y0:y1,x0:x1])[0].detach().cpu().numpy(), (1, 2, 0)))
+                #plt.show()
+                #plt.imshow(np.transpose(to_uint8(x_tgt[...,:w//2][...,y0:y1,x0:x1])[0].detach().cpu().numpy(), (1, 2, 0)))
+                #plt.show()
+                if args.stich:
+                    b, c, h, w = x_tgt_pred.shape
+                    loss_l2 = F.mse_loss((x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(), reduction="mean")
+                    loss_lpips = net_lpips((x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float()).mean()
+                    src_loss_l2 = F.mse_loss((x_src[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(), reduction="mean")
+                    src_loss_lpips = net_lpips((x_src[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float()).mean()
+
+                    # ---- PSNR computation (batch-aware) ----
+                    # -1~1 to 0~1
+                    x_tgt = x_tgt*0.5+0.5
+                    x_tgt_pred = x_tgt_pred*0.5+0.5
+                    x_src = x_src*0.5+0.5
+                    mse_per_batch = F.mse_loss(
+                        (x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(),
+                        (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(),
+                        reduction="none"
+                    ).view(b, -1).mean(dim=1)  # shape: (B,)
+                    psnr_per_batch = 10 * torch.log10(1.0 / mse_per_batch)
+                    psnr = psnr_per_batch.mean().item()
+
+                    src_mse_per_batch = F.mse_loss(
+                        (x_src[...,:w//2][...,y0:y1,x0:x1]).float(),
+                        (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(),
+                        reduction="none"
+                    ).view(b, -1).mean(dim=1)
+                    src_psnr_per_batch = 10 * torch.log10(1.0 / src_mse_per_batch)
+                    src_psnr = src_psnr_per_batch.mean().item()
+                else:
+                    loss_l2 = F.mse_loss((x_tgt_pred[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float(), reduction="mean")
+                    loss_lpips = net_lpips((x_tgt_pred[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float()).mean()
+                    src_loss_l2 = F.mse_loss((x_src[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float(), reduction="mean")
+                    src_loss_lpips = net_lpips((x_src[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float()).mean()
+
+                    # ---- PSNR computation (batch-aware) ----
+                    # -1~1 to 0~1
+                    x_tgt = x_tgt*0.5+0.5
+                    x_tgt_pred = x_tgt_pred*0.5+0.5
+                    x_src = x_src*0.5+0.5
+                    mse_per_batch = F.mse_loss(
+                        (x_tgt_pred[...,y0:y1,x0:x1]).float(),
+                        (x_tgt[...,y0:y1,x0:x1]).float(),
+                        reduction="none"
+                    ).view(b, -1).mean(dim=1)  # shape: (B,)
+                    psnr_per_batch = 10 * torch.log10(1.0 / mse_per_batch)
+                    psnr = psnr_per_batch.mean().item()
+
+                    src_mse_per_batch = F.mse_loss(
+                        (x_src[...,y0:y1,x0:x1]).float(),
+                        (x_tgt[...,y0:y1,x0:x1]).float(),
+                        reduction="none"
+                    ).view(b, -1).mean(dim=1)
+                    src_psnr_per_batch = 10 * torch.log10(1.0 / src_mse_per_batch)
+                    src_psnr = src_psnr_per_batch.mean().item()
+
+                l_l2.append(loss_l2.item())
+                l_lpips.append(loss_lpips.item())
+                src_l_l2.append(src_loss_l2.item())
+                src_l_lpips.append(src_loss_lpips.item())
+                l_psnr.append(psnr)
+                src_l_psnr.append(src_psnr)
+
+        logs["val/l2"] = np.mean(l_l2)
+        logs["val/lpips"] = np.mean(l_lpips)
+        logs["val/psnr"] = np.mean(l_psnr)
+        logs["val/src_l2"] = np.mean(src_l_l2)
+        logs["val/src_lpips"] = np.mean(src_l_lpips)
+        logs["val/src_psnr"] = np.mean(src_l_psnr)
+        for k in log_dict:
+            logs[k] = log_dict[k]
+        gc.collect()
+        torch.cuda.empty_cache()
+        accelerator.log(logs, step=0)
 
     # start the training loop
     for epoch in range(0, args.num_training_epochs):
@@ -377,19 +587,21 @@ def main(args):
             with accelerator.accumulate(*l_acc):
                 x_src = batch["conditioning_pixel_values"]
                 x_tgt = batch["output_pixel_values"]
+                nopad_mask = batch["nopad_mask"]
+            
                 B, V, C, H, W = x_src.shape
 
                 # forward pass
                 x_tgt_pred = net_difix(x_src, prompt_tokens=batch["input_ids"])       
                
                 # get attention
-                if accelerator.is_main_process and (global_step % args.viz_freq == 1):
+                if accelerator.is_main_process and (global_step % 100 == 0):
                     _, V, _, _, _ = x_src.shape  # number of views in this batch
-                    for tag in ("down",):
+                    for tag in ("down", "mid", "up"):
                         proc = REC_PROCS[tag]
                         h, w = ATT_HW[tag]
-                        if proc is not None and proc.last_attn_probs is not None:
-                            save_avg_attn_map(proc.avg_attn_vec, tag+"_"+str(global_step), h, w)
+                        #if proc is not None and proc.last_attn_probs is not None:
+                        save_avg_attn_map(proc.avg_attn_vec, x_src, tag+"_"+str(global_step), h, w)
 
                 x_tgt = rearrange(x_tgt, 'b v c h w -> (b v) c h w')
                 x_tgt_pred = rearrange(x_tgt_pred, 'b v c h w -> (b v) c h w')
@@ -403,55 +615,57 @@ def main(args):
                 if args.useRender:
                     if args.stich:
                         b, c, h, w = x_tgt_pred.shape
-                        loss_l2 = F.mse_loss(x_tgt_pred[...,:w//2].float(), x_tgt[...,:w//2].float(), reduction="mean") * args.lambda_l2
-                        loss_lpips = net_lpips(x_tgt_pred[...,:w//2].float(), x_tgt[...,:w//2].float()).mean() * args.lambda_lpips
+                        pred = x_tgt_pred[..., :w//2]
+                        tgt  = x_tgt[..., :w//2]
                     else:
-                        loss_l2 = F.mse_loss(x_tgt_pred[::2].float(), x_tgt[::2].float(), reduction="mean") * args.lambda_l2
-                        loss_lpips = net_lpips(x_tgt_pred[::2].float(), x_tgt[::2].float()).mean() * args.lambda_lpips
+                        pred = x_tgt_pred[::2]
+                        tgt  = x_tgt[::2]
                 else:
-                    loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
-                    loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
-                loss = loss_l2 #+ loss_lpips
+                    pred = x_tgt_pred
+                    tgt  = x_tgt
+
+                # ---- apply nopad_mask ----
+                nopad_mask = rearrange(nopad_mask, 'b v c h w -> (b v) c h w')
+                # TODO: reference does not support mask...
+                pred = pred * nopad_mask
+                tgt  = tgt * nopad_mask
+
+                #plt.imshow(np.transpose(to_uint8(pred)[0].detach().cpu().numpy(), (1, 2, 0)))
+                #plt.show()
+                #plt.imshow(np.transpose(to_uint8(tgt)[0].detach().cpu().numpy(), (1, 2, 0)))
+                #plt.show()
+
+                # ---- compute losses ----
+                loss_l2 = F.mse_loss(pred.float(), tgt.float(), reduction="mean") * args.lambda_l2
+                loss_lpips = net_lpips(pred.float(), tgt.float()).mean() * args.lambda_lpips
+                #loss_ssim = 1 - ssim(pred.float(), tgt.float(), data_range=1.0, size_average=True)
+                #loss_charb = charbonnier_loss(pred.float(), tgt.float())
+                #loss = loss_charb + loss_lpips 
+                loss = loss_l2 + loss_lpips
                 
                 # Gram matrix loss
                 if args.lambda_gram > 0:
                     if global_step > args.gram_loss_warmup_steps:
-                        if args.useRender:
-                            if args.stich:
-                                x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred[...,:w//2] * 0.5 + 0.5)
-                                crop_h, crop_w = 400, 400
-                                top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
-                                x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
-                        
-                                x_tgt_renorm = t_vgg_renorm(x_tgt[...,:w//2] * 0.5 + 0.5)
-                                x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
-                        
-                                loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                                #loss += loss_gram
-                            else:
-                                x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred[::2] * 0.5 + 0.5)
-                                crop_h, crop_w = 400, 400
-                                top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
-                                x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
-                        
-                                x_tgt_renorm = t_vgg_renorm(x_tgt[::2] * 0.5 + 0.5)
-                                x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
-                        
-                                loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                                #loss += loss_gram
-                        else:
-                            x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
-                            crop_h, crop_w = 400, 400
-                            top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
-                            x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
-                        
-                            x_tgt_renorm = t_vgg_renorm(x_tgt * 0.5 + 0.5)
-                            x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
-                        
-                            loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                            #loss += loss_gram
+                        # ---- renormalize ----
+                        x_tgt_pred_renorm = t_vgg_renorm(pred * 0.5 + 0.5)
+                        x_tgt_renorm = t_vgg_renorm(tgt * 0.5 + 0.5)
+
+                        # ---- random crop ----
+                        crop_h, crop_w = 400, 400
+                        top = random.randint(0, H - crop_h)
+                        left = random.randint(0, W - crop_w)
+                        x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
+                        x_tgt_renorm      = crop(x_tgt_renorm, top, left, crop_h, crop_w)
+
+                        # ---- gram loss ----
+                        loss_gram = gram_loss(
+                            x_tgt_pred_renorm.to(weight_dtype),
+                            x_tgt_renorm.to(weight_dtype),
+                            net_vgg
+                        ) * args.lambda_gram
+                        # loss = loss + loss_gram
                     else:
-                        loss_gram = torch.tensor(0.0).to(weight_dtype)                    
+                        loss_gram = torch.tensor(0.0, dtype=weight_dtype, device=x_tgt_pred.device)                    
 
                 accelerator.backward(loss, retain_graph=False)
                 if accelerator.sync_gradients:
@@ -533,6 +747,7 @@ def main(args):
                     # compute validation set L2, LPIPS
                     if args.eval_freq > 0 and global_step % args.eval_freq == 1:
                         l_l2, l_lpips = [], []
+                        l_psnr = []
                         #log_dict = {"sample/source": [], "sample/target": [], "sample/model_output": [], "sample/results": []}
                         log_dict = {"sample/results": []}
                         seen = {}
@@ -541,16 +756,23 @@ def main(args):
                                 break
                             x_src = batch_val["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
                             x_tgt = batch_val["output_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+                            nopad_mask = batch_val["nopad_mask"].to(accelerator.device, dtype=weight_dtype)
                             B, V, C, H, W = x_src.shape
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
                                 # forward pass
-                                x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
-                                
+                                x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())                                
+
                                 if batch_val["scene_id"][0] not in seen:
                                     seen[batch_val["scene_id"][0]] = 0
+                                
+                                scene_flag = True
+                                for s in ["crab", "yoda", "android", "patio_first", "statue", "mountain", "corner"]:
+                                    if s in batch_val["scene_id"][0]:
+                                        scene_flag = False
 
-                                if seen[batch_val["scene_id"][0]] < 5:
+                                if step>250 and scene_flag and seen[batch_val["scene_id"][0]] < 12:
+                                    #print(batch_val["scene_id"][0])
                                     seen[batch_val["scene_id"][0]] += 1
                                 #if step % 2 == 0: #10 == 0:
                                     #log_dict["sample/source"].append(wandb.Image(to_uint8(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu()), caption=f"idx={len(log_dict['sample/source'])}"))
@@ -596,19 +818,48 @@ def main(args):
                                 x_tgt = x_tgt[:, 0] # take the input view
                                 x_tgt_pred = x_tgt_pred[:, 0] # take the input view
                                 # compute the reconstruction losses
+                                ys, xs = torch.where(nopad_mask[0, 0, 0, :, :])
+                                y0, y1 = ys.min().item(), ys.max().item() + 1
+                                x0, x1 = xs.min().item(), xs.max().item() + 1
+                                #plt.imshow(np.transpose(to_uint8(x_tgt_pred[...,:w//2][...,y0:y1,x0:x1])[0].detach().cpu().numpy(), (1, 2, 0)))
+                                #plt.show()
+                                #plt.imshow(np.transpose(to_uint8(x_tgt[...,:w//2][...,y0:y1,x0:x1])[0].detach().cpu().numpy(), (1, 2, 0)))
+                                #plt.show()
                                 if args.stich:
                                     b, c, h, w = x_tgt_pred.shape
-                                    loss_l2 = F.mse_loss(x_tgt_pred[...,:w//2].float(), x_tgt[...,:w//2].float(), reduction="mean")
-                                    loss_lpips = net_lpips(x_tgt_pred[...,:w//2].float(), x_tgt[...,:w//2].float()).mean()
+                                    loss_l2 = F.mse_loss((x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(), reduction="mean")
+                                    loss_lpips = net_lpips((x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float()).mean()
+                                    # ---- PSNR computation (batch-aware) ----
+                                    x_tgt_pred = x_tgt_pred*0.5+0.5
+                                    x_tgt = x_tgt*0.5+0.5
+                                    mse_per_batch = F.mse_loss(
+                                        (x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(),
+                                        (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(),
+                                        reduction="none"
+                                    ).view(b, -1).mean(dim=1)  # shape: (B,)
+                                    psnr_per_batch = 10 * torch.log10(1.0 / mse_per_batch)
+                                    psnr = psnr_per_batch.mean().item()
                                 else:
-                                    loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
-                                    loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
-
+                                    loss_l2 = F.mse_loss((x_tgt_pred[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float(), reduction="mean")
+                                    loss_lpips = net_lpips((x_tgt_pred[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float()).mean()
+                                    # ---- PSNR computation (batch-aware) ----
+                                    x_tgt_pred = x_tgt_pred*0.5+0.5
+                                    x_tgt = x_tgt*0.5+0.5
+                                    mse_per_batch = F.mse_loss(
+                                        (x_tgt_pred[...,y0:y1,x0:x1]).float(),
+                                        (x_tgt[...,y0:y1,x0:x1]).float(),
+                                        reduction="none"
+                                    ).view(b, -1).mean(dim=1)  # shape: (B,)
+                                    psnr_per_batch = 10 * torch.log10(1.0 / mse_per_batch)
+                                    psnr_per_batch = 10 * torch.log10(1.0 / mse_per_batch)
+                                    psnr = psnr_per_batch.mean().item()
                                 l_l2.append(loss_l2.item())
                                 l_lpips.append(loss_lpips.item())
+                                l_psnr.append(psnr)
 
                         logs["val/l2"] = np.mean(l_l2)
                         logs["val/lpips"] = np.mean(l_lpips)
+                        logs["val/psnr"] = np.mean(l_psnr)
                         for k in log_dict:
                             logs[k] = log_dict[k]
                         gc.collect()
@@ -633,7 +884,7 @@ if __name__ == "__main__":
 
     # validation eval args
     parser.add_argument("--eval_freq", default=100, type=int)
-    parser.add_argument("--num_samples_eval", type=int, default=200, help="Number of samples to use for all evaluation")
+    parser.add_argument("--num_samples_eval", type=int, default=600, help="Number of samples to use for all evaluation")
 
     parser.add_argument("--viz_freq", type=int, default=100, help="Frequency of visualizing the outputs.")
     parser.add_argument("--tracker_project_name", type=str, default="johnnylu/DifixSLS", help="The name of the wandb project to log to.")
@@ -654,7 +905,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument("--resolution", type=int, default=512,)
     parser.add_argument("--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader.")
-    parser.add_argument("--num_training_epochs", type=int, default=10)
+    parser.add_argument("--num_training_epochs", type=int, default=10000)#10)
     parser.add_argument("--max_train_steps", type=int, default=10_000,)
     parser.add_argument("--checkpointing_steps", type=int, default=500,)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.",)

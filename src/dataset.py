@@ -75,9 +75,13 @@ class PairedDataset(torch.utils.data.Dataset):
             return self.__getitem__(idx + 1)
 
         img_t = F.to_tensor(input_img)
+        nopad_mask = torch.ones_like(img_t)
         #img_t = F.resize(img_t, self.image_size)
         img_t, top, left = pad_and_crop(img_t, self.image_size)
+        nopad_mask, _, _ = pad_and_crop(nopad_mask, self.image_size, top, left)
         img_t = F.normalize(img_t, mean=[0.5], std=[0.5])
+
+
 
         output_t = F.to_tensor(output_img)
         output_t, _, _ = pad_and_crop(output_t, self.image_size, top, left)
@@ -96,11 +100,14 @@ class PairedDataset(torch.utils.data.Dataset):
         else:
             img_t = img_t.unsqueeze(0)
             output_t = output_t.unsqueeze(0)
+        nopad_mask = nopad_mask.unsqueeze(0)
 
         out = {
             "output_pixel_values": output_t,
             "conditioning_pixel_values": img_t,
             "caption": caption,
+            "scene_id": scene_id,
+            "nopad_mask": nopad_mask
         }
         
         if self.tokenizer is not None:
@@ -156,7 +163,9 @@ class PairedDatasetCus(torch.utils.data.Dataset):
 
         img_t = F.to_tensor(input_img)
         #img_t = F.resize(img_t, self.image_size)
+        nopad_mask = torch.ones_like(img_t)
         img_t, top, left = pad_and_crop(img_t, self.image_size)
+        nopad_mask, _, _ = pad_and_crop(nopad_mask, self.image_size, top, left)
         img_t = F.normalize(img_t, mean=[0.5], std=[0.5])
 
         output_t = F.to_tensor(output_img)
@@ -260,11 +269,14 @@ class PairedDatasetCus(torch.utils.data.Dataset):
             img_t = torch.stack([img_t, ref_t], dim=0)
             output_t = torch.stack([output_t, ref_t], dim=0)
 
+        nopad_mask = nopad_mask.unsqueeze(0)
+
         out = {
             "output_pixel_values": output_t,
             "conditioning_pixel_values": img_t,
             "caption": caption,
-            "scene_id": scene_id
+            "scene_id": scene_id,
+            "nopad_mask": nopad_mask.to(torch.bool) 
         }
         
         if self.tokenizer is not None:

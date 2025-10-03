@@ -55,7 +55,7 @@ def compute_metrics_from_saved(save_dir: Path, force_cpu: bool = False):
     # Metrics
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="alex").to(device)
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(device)
     fid_metric = FrechetInceptionDistance(normalize=True).to(device)
 
     # Aggregators
@@ -82,6 +82,7 @@ def compute_metrics_from_saved(save_dir: Path, force_cpu: bool = False):
         # Per-image metrics
         psnr_val = psnr_metric(s, t).item()
         ssim_val = ssim_metric(s.unsqueeze(0), t.unsqueeze(0)).item()
+        # -1~1
         lpips_val = lpips_metric((s * 2 - 1).unsqueeze(0), (t * 2 - 1).unsqueeze(0)).item()
 
         # Aggregate
