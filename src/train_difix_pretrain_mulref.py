@@ -717,7 +717,7 @@ def main(args):
     # start the training loop
     for epoch in range(0, args.num_training_epochs):
 
-        dl_train.set_epoch(epoch)   # unlock harder buckets progressively
+        dl_train.dataset.set_epoch(epoch)   # unlock harder buckets progressively
         print(f"Epoch {epoch} → unlocked bucket: {dl_train.dataset._unlocked_bucket}, uniform_all: {dl_train.dataset._uniform_all}")
 
         for step, batch in enumerate(dl_train):
