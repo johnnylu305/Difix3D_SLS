@@ -1,6 +1,6 @@
 # 2e-5
 accelerate launch --mixed_precision=bf16 src/train_difix_pretrain_mulref.py \
-    --output_dir=./outputs_newjson_src_stich_no0.3_lr5e-5_vaeresidual/difix/train \
+    --output_dir=./outputs_newjson_src_stich_lr5e-5_curlr/difix/train \
     --dataset_path="../SLS_Fixer_Data/dataset.json" \
     --max_train_steps 30000 \
     --resolution=512 --learning_rate 5e-5 \

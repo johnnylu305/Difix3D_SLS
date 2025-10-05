@@ -25,7 +25,7 @@ from diffusers.optimization import get_scheduler
 import wandb
 
 from model import Difix, load_ckpt_from_state_dict, save_ckpt, GatedFuse
-from dataset import PairedDatasetCus
+from dataset import PairedDatasetCus, PairedDatasetCur
 from loss import gram_loss
 from pipeline_difix import DifixPipeline
 
@@ -399,8 +399,10 @@ def main(args):
         num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles, power=args.lr_power,)
 
-    dataset_train = PairedDatasetCus(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv, useRender=args.useRender, stich=args.stich, select=args.select)
-    dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
+    dataset_train = PairedDatasetCur(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv, useRender=args.useRender, stich=args.stich, select=args.select)
+    # shuffle false for cur loader
+    dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=False, num_workers=args.dataloader_num_workers)
+    #dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
     dataset_val = PairedDatasetCus(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer, mulref=True, nv=args.nv, useRender=args.useRender, stich=args.stich, select=args.select)
     random.Random(42).shuffle(dataset_val.img_ids)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
@@ -714,6 +716,10 @@ def main(args):
 
     # start the training loop
     for epoch in range(0, args.num_training_epochs):
+
+        dl_train.set_epoch(epoch)   # unlock harder buckets progressively
+        print(f"Epoch {epoch} → unlocked bucket: {dl_train.dataset._unlocked_bucket}, uniform_all: {dl_train.dataset._uniform_all}")
+
         for step, batch in enumerate(dl_train):
             l_acc = [net_difix]
             with accelerator.accumulate(*l_acc):
@@ -1127,7 +1133,7 @@ if __name__ == "__main__":
 
     # validation eval args
     parser.add_argument("--eval_freq", default=100, type=int)
-    parser.add_argument("--num_samples_eval", type=int, default=600, help="Number of samples to use for all evaluation")
+    parser.add_argument("--num_samples_eval", type=int, default=30, help="Number of samples to use for all evaluation")
 
     parser.add_argument("--viz_freq", type=int, default=100, help="Frequency of visualizing the outputs.")
     parser.add_argument("--tracker_project_name", type=str, default="johnnylu/DifixSLS", help="The name of the wandb project to log to.")
