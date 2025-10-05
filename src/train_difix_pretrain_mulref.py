@@ -24,7 +24,7 @@ from diffusers.optimization import get_scheduler
 
 import wandb
 
-from model import Difix, load_ckpt_from_state_dict, save_ckpt
+from model import Difix, load_ckpt_from_state_dict, save_ckpt, GatedFuse
 from dataset import PairedDatasetCus
 from loss import gram_loss
 from pipeline_difix import DifixPipeline
@@ -38,10 +38,36 @@ os.makedirs("./output_att", exist_ok=True)
 REC_PROCS = {"down": None, "mid": None, "up": None}
 ATT_HW = {"down": (64, 128), "mid": (8, 16), "up": (64, 128)}
 
+
+DATASET_IDS = {"robust_nerf": ["crab2_first", "android_first", "yoda_first", "statue_first"], 
+               "on-the-go": ["corner_first", "fountain_first", "mountain_first", "patio_first", "patio_high_first", "spot_first"]}
+
+def get_pseudo_mask(sd_out, src, tgt, margin = 1e-3):
+    b, v, c, h, w = sd_out.shape
+    assert v==1
+    sd_out = sd_out[:, 0]
+    src = src[:, 0]
+    tgt = tgt[:, 0]
+    # per-pixel L2 errors reduced over channels
+    err_sd  = ((sd_out - tgt) ** 2).mean(dim=1, keepdim=True)   # (B,1,H,W)
+    err_src = ((src - tgt) ** 2).mean(dim=1, keepdim=True)   # (B,1,H,W)
+
+    better_sd  = (err_src - err_sd) >  margin   # sd_out clearly better
+    better_src = (err_sd  - err_src) >  margin  # src clearly better
+    
+    # -1: src, 1: sd_out, 0: ignore
+    tri_mask = torch.where(
+        better_sd,  torch.ones_like(err_sd),
+        torch.where(better_src, -torch.ones_like(err_sd),
+                    torch.zeros_like(err_sd))
+    )
+
+    tri_mask = tri_mask.unsqueeze(1)
+    return tri_mask
+
 def charbonnier_loss(pred, target, epsilon=1e-6):
     diff = pred - target
     return torch.mean(torch.sqrt(diff * diff + epsilon**2))
-
 
 def save_avg_attn_map(
     avg_vec: torch.Tensor,     # [B, K], where K = att_h*att_w or M*att_h*att_w
@@ -289,6 +315,10 @@ def main(args):
         mv_unet=args.mv_unet,
     )
 
+    use_gate = False
+    if use_gate:
+        fuse_net = GatedFuse()
+
     # get attention
     # --- attach processors to exactly one down/mid/up self-attn (attn1) ---
     unet_ref = net_difix.unet  # keep a non-wrapped reference for name matching (before accelerator.prepare)
@@ -315,7 +345,8 @@ def main(args):
     load_pipe_weights_into_model(pipe, net_difix, report=True)
     del pipe
     net_difix.set_train()
-
+    if use_gate:
+        fuse_net.train()
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -341,6 +372,9 @@ def main(args):
     layers_to_opt = []
     layers_to_opt += list(net_difix.unet.parameters())
    
+    #if use_gate:
+    #    layers_to_opt += list(fuse_net.parameters())
+
     for n, _p in net_difix.vae.named_parameters():
         if "lora" in n and "vae_skip" in n:
             assert _p.requires_grad
@@ -351,10 +385,15 @@ def main(args):
         list(net_difix.vae.decoder.skip_conv_3.parameters()) + \
         list(net_difix.vae.decoder.skip_conv_4.parameters())
 
-
-    optimizer = torch.optim.AdamW(layers_to_opt, lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,)
+    if use_gate:
+        optimizer = torch.optim.AdamW([
+            {"params": layers_to_opt, "lr": args.learning_rate, "weight_decay": args.adam_weight_decay},
+            {"params": list(fuse_net.parameters()), "lr": 10*args.learning_rate, "weight_decay": args.adam_weight_decay}
+        ], betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_epsilon)
+    else:
+        optimizer = torch.optim.AdamW(layers_to_opt, lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,)
     lr_scheduler = get_scheduler(args.lr_scheduler, optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
@@ -400,11 +439,18 @@ def main(args):
     net_difix.to(accelerator.device, dtype=weight_dtype)
     net_lpips.to(accelerator.device, dtype=weight_dtype)
     net_vgg.to(accelerator.device, dtype=weight_dtype)
-    
+    if use_gate:
+        fuse_net.to(accelerator.device, dtype=weight_dtype)
+
     # Prepare everything with our `accelerator`.
-    net_difix, optimizer, dl_train, lr_scheduler = accelerator.prepare(
-        net_difix, optimizer, dl_train, lr_scheduler
-    )
+    if use_gate:
+        net_difix, optimizer, dl_train, lr_scheduler, fuse_net = accelerator.prepare(
+            net_difix, optimizer, dl_train, lr_scheduler, fuse_net
+        )
+    else:
+        net_difix, optimizer, dl_train, lr_scheduler = accelerator.prepare(
+            net_difix, optimizer, dl_train, lr_scheduler
+        )
     net_lpips, net_vgg = accelerator.prepare(net_lpips, net_vgg)
     # renorm with image net statistics
     t_vgg_renorm =  transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
@@ -421,8 +467,8 @@ def main(args):
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
 
-        progress_bar = tqdm(range(0, args.max_train_steps), initial=global_step, desc="Steps",
-            disable=not accelerator.is_local_main_process,)
+    progress_bar = tqdm(range(0, args.max_train_steps), initial=global_step, desc="Steps",
+        disable=not accelerator.is_local_main_process,)
 
 
     # compute validation set L2, LPIPS
@@ -431,9 +477,15 @@ def main(args):
         logs = {}
         l_l2, l_lpips, src_l_l2, src_l_lpips = [], [], [], []
         l_psnr, src_l_psnr = [], []
+        if use_gate:
+            fuse_l_l2, fuse_l_lpips, fuse_l_psnr = [], [], []
         #log_dict = {"sample/source": [], "sample/target": [], "sample/model_output": [], "sample/results": []}
         log_dict = {"sample/results": []}
         seen = {}
+        per_scene_psnr = {}
+        src_per_scene_psnr = {}
+        if use_gate:
+            fuse_per_scene_psnr = {}
         for step, batch_val in enumerate(dl_val):
             #print(step)
             if step >= args.num_samples_eval:
@@ -446,6 +498,12 @@ def main(args):
             with torch.no_grad():
                 # forward pass
                 x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
+                if use_gate:
+                    if args.stich:
+                        x_tgt_fuse, g = accelerator.unwrap_model(fuse_net)(x_tgt_pred[..., :W//2], x_src[..., :W//2])
+                        #print(x_tgt_fuse.shape, g.shape)
+                    else:
+                        raise NotImplementedError("Not Implemented")
                 
                 if batch_val["scene_id"][0] not in seen:
                     seen[batch_val["scene_id"][0]] = 0
@@ -471,12 +529,19 @@ def main(args):
                         src, ref = x_src[..., :w2], x_src[..., w2:]
                         src_tar = x_tgt[..., :w2]
                         src_output, ref_output = x_tgt_pred[..., :w2], x_tgt_pred[..., w2:]
-
-                        # row1: src_tar | src | src_output
-                        row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
-                        # row2: blank | ref | ref_output
-                        blank = -torch.ones_like(ref)
-                        row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
+                        if use_gate:
+                            # row1: src_tar | src | src_output
+                            row1 = torch.cat([src_tar, src, src_output, x_tgt_fuse], dim=-1)   # (b, v, c, h, 3*w2)
+                            # row2: blank | ref | ref_output
+                            blank = -torch.ones_like(ref)
+                            g_expand = g.expand(-1, -1, 3, -1, -1)
+                            row2 = torch.cat([blank, ref, ref_output, g_expand], dim=-1)     # (b, v, c, h, 3*w2)
+                        else:
+                            # row1: src_tar | src | src_output
+                            row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
+                            # row2: blank | ref | ref_output
+                            blank = -torch.ones_like(ref)
+                            row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
                         # 2×3 grid
                         grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
                     else:
@@ -501,6 +566,8 @@ def main(args):
                 x_tgt = x_tgt[:, 0] # take the input view
                 x_tgt_pred = x_tgt_pred[:, 0] # take the input view
                 x_src = x_src[:, 0]
+                if use_gate:
+                    x_tgt_fuse = x_tgt_fuse[:, 0]
                 # compute the reconstruction losses
                 ys, xs = torch.where(nopad_mask[0, 0, 0, :, :])
                 y0, y1 = ys.min().item(), ys.max().item() + 1
@@ -515,12 +582,16 @@ def main(args):
                     loss_lpips = net_lpips((x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float()).mean()
                     src_loss_l2 = F.mse_loss((x_src[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(), reduction="mean")
                     src_loss_lpips = net_lpips((x_src[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float()).mean()
-
+                    if use_gate:
+                        fuse_loss_l2 = F.mse_loss((x_tgt_fuse[...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(), reduction="mean")
+                        fuse_loss_lpips = net_lpips((x_tgt_fuse[...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float()).mean()
                     # ---- PSNR computation (batch-aware) ----
                     # -1~1 to 0~1
                     x_tgt = x_tgt*0.5+0.5
                     x_tgt_pred = x_tgt_pred*0.5+0.5
                     x_src = x_src*0.5+0.5
+                    if use_gate:
+                        x_tgt_fuse = x_tgt_fuse*0.5+0.5
                     mse_per_batch = F.mse_loss(
                         (x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(),
                         (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(),
@@ -536,6 +607,14 @@ def main(args):
                     ).view(b, -1).mean(dim=1)
                     src_psnr_per_batch = 10 * torch.log10(1.0 / src_mse_per_batch)
                     src_psnr = src_psnr_per_batch.mean().item()
+                    if use_gate:
+                        fuse_mse_per_batch = F.mse_loss(
+                            (x_tgt_fuse[...,y0:y1,x0:x1]).float(),
+                            (x_tgt[...,y0:y1,x0:x1]).float(),
+                            reduction="none"
+                        ).view(b, -1).mean(dim=1)
+                        fuse_psnr_per_batch = 10 * torch.log10(1.0 / fuse_mse_per_batch)
+                        fuse_psnr = fuse_psnr_per_batch.mean().item()
                 else:
                     loss_l2 = F.mse_loss((x_tgt_pred[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float(), reduction="mean")
                     loss_lpips = net_lpips((x_tgt_pred[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float()).mean()
@@ -563,12 +642,24 @@ def main(args):
                     src_psnr_per_batch = 10 * torch.log10(1.0 / src_mse_per_batch)
                     src_psnr = src_psnr_per_batch.mean().item()
 
+                scene_id = batch_val["scene_id"][0]
+                if scene_id not in per_scene_psnr:
+                    per_scene_psnr[scene_id] = []
+                    src_per_scene_psnr[scene_id] = []
+                per_scene_psnr[scene_id].append(psnr)
+                src_per_scene_psnr[scene_id].append(src_psnr)
+
                 l_l2.append(loss_l2.item())
                 l_lpips.append(loss_lpips.item())
                 src_l_l2.append(src_loss_l2.item())
                 src_l_lpips.append(src_loss_lpips.item())
                 l_psnr.append(psnr)
                 src_l_psnr.append(src_psnr)
+                if use_gate:
+                    fuse_l_psnr.append(fuse_psnr)
+                    if scene_id not in fuse_per_scene_psnr:
+                        fuse_per_scene_psnr[scene_id] = []
+                    fuse_per_scene_psnr[scene_id].append(fuse_psnr)
 
         logs["val/l2"] = np.mean(l_l2)
         logs["val/lpips"] = np.mean(l_lpips)
@@ -576,11 +667,50 @@ def main(args):
         logs["val/src_l2"] = np.mean(src_l_l2)
         logs["val/src_lpips"] = np.mean(src_l_lpips)
         logs["val/src_psnr"] = np.mean(src_l_psnr)
+        for k, v in per_scene_psnr.items():
+            logs[f"val_scene/{k}/psnr"] = np.mean(v)
+        for k, v in src_per_scene_psnr.items():
+            logs[f"val_scene/{k}/src_psnr"] = np.mean(v)
+        if use_gate:
+            logs["val/fuse_psnr"] = np.mean(fuse_l_psnr)
+            for k, v in fuse_per_scene_psnr.items():
+                logs[f"val_scene/{k}/fuse_psnr"] = np.mean(v)
+
+        robust_nerf = []
+        src_robust_nerf = []
+        fuse_robust_nerf = []
+        on_the_go = []
+        src_on_the_go = []
+        fuse_on_the_go = []
+        for k in per_scene_psnr:
+            if k in DATASET_IDS["robust_nerf"]:
+                robust_nerf.append(np.mean(per_scene_psnr[k]))
+                src_robust_nerf.append(np.mean(src_per_scene_psnr[k]))
+                if use_gate:
+                    fuse_robust_nerf.append(np.mean(fuse_per_scene_psnr[k]))
+            elif k in DATASET_IDS["on-the-go"]:
+                on_the_go.append(np.mean(per_scene_psnr[k]))
+                src_on_the_go.append(np.mean(src_per_scene_psnr[k]))
+                if use_gate:
+                    fuse_on_the_go.append(np.mean(fuse_per_scene_psnr[k]))           
+            else:
+                raise ValueError("Something went wrong!")
+        
+        logs["val_dataset/robust_nerf/psnr"] = np.mean(robust_nerf)
+        logs["val_dataset/robust_nerf/src_psnr"] = np.mean(src_robust_nerf)
+        if use_gate:
+            logs["val_dataset/robust_nerf/fuse_psnr"] = np.mean(fuse_robust_nerf)
+
+        logs["val_dataset/on_the_go/psnr"] = np.mean(on_the_go)
+        logs["val_dataset/on_the_go/src_psnr"] = np.mean(src_on_the_go)
+        if use_gate:
+            logs["val_dataset/on_the_go/fuse_psnr"] = np.mean(fuse_on_the_go)
+          
         for k in log_dict:
             logs[k] = log_dict[k]
         gc.collect()
         torch.cuda.empty_cache()
-        accelerator.log(logs, step=0)
+        accelerator.log(logs, step=0)       
 
     # start the training loop
     for epoch in range(0, args.num_training_epochs):
@@ -595,7 +725,12 @@ def main(args):
 
                 # forward pass
                 x_tgt_pred = net_difix(x_src, prompt_tokens=batch["input_ids"])       
-               
+                if use_gate:
+                    if args.stich:
+                        x_tgt_fuse, g = fuse_net(x_tgt_pred[..., :w//2], x_src[..., :w//2])
+                        #pseudo_mask = get_pseudo_mask(x_tgt_pred[..., :w//2].detach(), x_src[..., :w//2].detach(), x_tgt[..., :w//2].detach(), margin=1e-3)
+                    else:
+                        raise NotImplementedError("Not Implemented")
                 # get attention
                 if accelerator.is_main_process and (global_step % 100 == 0):
                     _, V, _, _, _ = x_src.shape  # number of views in this batch
@@ -607,6 +742,9 @@ def main(args):
 
                 x_tgt = rearrange(x_tgt, 'b v c h w -> (b v) c h w')
                 x_tgt_pred = rearrange(x_tgt_pred, 'b v c h w -> (b v) c h w')
+                if use_gate:
+                    x_tgt_fuse = rearrange(x_tgt_fuse, 'b v c h w -> (b v) c h w')
+
                          
                 # Reconstruction loss
                 # x_tgt: (bv) c h w 
@@ -619,6 +757,8 @@ def main(args):
                         b, c, h, w = x_tgt_pred.shape
                         pred = x_tgt_pred[..., :w//2]
                         tgt  = x_tgt[..., :w//2]
+                        if use_gate:
+                            pred_fuse = x_tgt_fuse
                     else:
                         pred = x_tgt_pred[::2]
                         tgt  = x_tgt[::2]
@@ -631,6 +771,8 @@ def main(args):
                 # TODO: reference does not support mask...
                 pred = pred * nopad_mask
                 tgt  = tgt * nopad_mask
+                if use_gate:
+                    pred_fuse = pred_fuse * nopad_mask
 
                 #plt.imshow(np.transpose(to_uint8(pred)[0].detach().cpu().numpy(), (1, 2, 0)))
                 #plt.show()
@@ -644,6 +786,14 @@ def main(args):
                 #loss_charb = charbonnier_loss(pred.float(), tgt.float())
                 #loss = loss_charb + loss_lpips 
                 loss = loss_l2 + loss_lpips
+
+                if use_gate:
+                    fuse_loss_l2 = F.mse_loss(pred_fuse.float(), tgt.float(), reduction="mean") * args.lambda_l2
+                    fuse_loss_lpips = net_lpips(pred_fuse.float(), tgt.float()).mean() * args.lambda_lpips
+                    #ignore_mask = pseudo_mask!=0
+                    #gate_loss_l2 = F.mse_loss(g.float()*nopad_mask*ignore_mask, pseudo_mask.float()*nopad_mask*ignore_mask, reduction="mean")
+                    #loss += gate_loss_l2 
+                    loss += fuse_loss_l2+fuse_loss_lpips
                 
                 # Gram matrix loss
                 if args.lambda_gram > 0:
@@ -678,6 +828,8 @@ def main(args):
                 
                 x_tgt = rearrange(x_tgt, '(b v) c h w -> b v c h w', v=V)
                 x_tgt_pred = rearrange(x_tgt_pred, '(b v) c h w -> b v c h w', v=V)
+                if use_gate:
+                    x_tgt_fuse = rearrange(x_tgt_fuse, '(b v) c h w -> b v c h w', v=V)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -691,6 +843,10 @@ def main(args):
                     logs["loss_lpips"] = loss_lpips.detach().item()
                     if args.lambda_gram > 0:
                         logs["loss_gram"] = loss_gram.detach().item()
+                    if use_gate:
+                        logs["fuse_loss_l2"] = fuse_loss_l2.detach().item()
+                        logs["fuse_loss_lpips"] = fuse_loss_lpips.detach().item()
+                        #logs["gate_loss_l2"] = gate_loss_l2.detach().item()
                     progress_bar.set_postfix(**logs)
 
                     # viz some images
@@ -710,12 +866,20 @@ def main(args):
                             src, ref = x_src[..., :w2], x_src[..., w2:]
                             src_tar = x_tgt[..., :w2]
                             src_output, ref_output = x_tgt_pred[..., :w2], x_tgt_pred[..., w2:]
-
-                            # row1: src_tar | src | src_output
-                            row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
-                            # row2: blank | ref | ref_output
-                            blank = -torch.ones_like(ref)
-                            row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
+                            if use_gate:
+                                # row1: src_tar | src | src_output
+                                row1 = torch.cat([src_tar, src, src_output, x_tgt_fuse], dim=-1)   # (b, v, c, h, 3*w2)
+                                # row2: blank | ref | ref_output
+                                blank = -torch.ones_like(ref)
+                                g_expand = g.expand(-1, -1, 3, -1, -1)
+                                #pseudo_mask_expand = pseudo_mask.expand(-1, -1, 3, -1, -1)
+                                row2 = torch.cat([blank, ref, ref_output, g_expand], dim=-1)     # (b, v, c, h, 3*w2)
+                            else:
+                                # row1: src_tar | src | src_output
+                                row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
+                                # row2: blank | ref | ref_output
+                                blank = -torch.ones_like(ref)
+                                row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
                             # 2×3 grid
                             grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
                         else:
@@ -750,6 +914,10 @@ def main(args):
                     if args.eval_freq > 0 and global_step % args.eval_freq == 1:
                         l_l2, l_lpips = [], []
                         l_psnr = []
+                        per_scene_psnr = {}
+                        fuse_per_scene_psnr = {}
+                        if use_gate:
+                            fuse_l_l2, fuse_l_lpips, fuse_l_psnr = [], [], []
                         #log_dict = {"sample/source": [], "sample/target": [], "sample/model_output": [], "sample/results": []}
                         log_dict = {"sample/results": []}
                         seen = {}
@@ -763,8 +931,9 @@ def main(args):
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
                                 # forward pass
-                                x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())                                
-
+                                x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
+                                if use_gate:                                
+                                    x_tgt_fuse, g = accelerator.unwrap_model(fuse_net)(x_tgt_pred[...,:w//2], x_src[...,:w//2])
                                 if batch_val["scene_id"][0] not in seen:
                                     seen[batch_val["scene_id"][0]] = 0
                                 
@@ -790,12 +959,19 @@ def main(args):
                                         src, ref = x_src[..., :w2], x_src[..., w2:]
                                         src_tar = x_tgt[..., :w2]
                                         src_output, ref_output = x_tgt_pred[..., :w2], x_tgt_pred[..., w2:]
-
-                                        # row1: src_tar | src | src_output
-                                        row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
-                                        # row2: blank | ref | ref_output
-                                        blank = -torch.ones_like(ref)
-                                        row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
+                                        if use_gate:
+                                            # row1: src_tar | src | src_output
+                                            row1 = torch.cat([src_tar, src, src_output, x_tgt_fuse], dim=-1)   # (b, v, c, h, 3*w2)
+                                            # row2: blank | ref | ref_output
+                                            blank = -torch.ones_like(ref)
+                                            g_expand = g.expand(-1, -1, 3, -1, -1)
+                                            row2 = torch.cat([blank, ref, ref_output, g_expand], dim=-1)     # (b, v, c, h, 3*w2)
+                                        else:
+                                            # row1: src_tar | src | src_output
+                                            row1 = torch.cat([src_tar, src, src_output], dim=-1)   # (b, v, c, h, 3*w2)
+                                            # row2: blank | ref | ref_output
+                                            blank = -torch.ones_like(ref)
+                                            row2 = torch.cat([blank, ref, ref_output], dim=-1)     # (b, v, c, h, 3*w2)
                                         # 2×3 grid
                                         grid = torch.cat([row1, row2], dim=-2)                 # (b, v, c, 2*h, 3*w2)
                                     else:
@@ -819,6 +995,8 @@ def main(args):
                                 # b v c h w -> b c h w
                                 x_tgt = x_tgt[:, 0] # take the input view
                                 x_tgt_pred = x_tgt_pred[:, 0] # take the input view
+                                if use_gate:
+                                    x_tgt_fuse = x_tgt_fuse[:, 0]
                                 # compute the reconstruction losses
                                 ys, xs = torch.where(nopad_mask[0, 0, 0, :, :])
                                 y0, y1 = ys.min().item(), ys.max().item() + 1
@@ -831,9 +1009,14 @@ def main(args):
                                     b, c, h, w = x_tgt_pred.shape
                                     loss_l2 = F.mse_loss((x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(), reduction="mean")
                                     loss_lpips = net_lpips((x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float()).mean()
+                                    if use_gate:
+                                        fuse_loss_l2 = F.mse_loss((x_tgt_fuse[...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(), reduction="mean")
+                                        fuse_loss_lpips = net_lpips((x_tgt_fuse[...,y0:y1,x0:x1]).float(), (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float()).mean()
                                     # ---- PSNR computation (batch-aware) ----
                                     x_tgt_pred = x_tgt_pred*0.5+0.5
                                     x_tgt = x_tgt*0.5+0.5
+                                    if use_gate:
+                                        x_tgt_fuse = x_tgt_fuse*0.5+0.5
                                     mse_per_batch = F.mse_loss(
                                         (x_tgt_pred[...,:w//2][...,y0:y1,x0:x1]).float(),
                                         (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(),
@@ -841,6 +1024,14 @@ def main(args):
                                     ).view(b, -1).mean(dim=1)  # shape: (B,)
                                     psnr_per_batch = 10 * torch.log10(1.0 / mse_per_batch)
                                     psnr = psnr_per_batch.mean().item()
+                                    if use_gate:
+                                        fuse_mse_per_batch = F.mse_loss(
+                                            (x_tgt_fuse[...,y0:y1,x0:x1]).float(),
+                                            (x_tgt[...,:w//2][...,y0:y1,x0:x1]).float(),
+                                            reduction="none"
+                                        ).view(b, -1).mean(dim=1)  # shape: (B,)
+                                        fuse_psnr_per_batch = 10 * torch.log10(1.0 / fuse_mse_per_batch)
+                                        fuse_psnr = fuse_psnr_per_batch.mean().item()
                                 else:
                                     loss_l2 = F.mse_loss((x_tgt_pred[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float(), reduction="mean")
                                     loss_lpips = net_lpips((x_tgt_pred[...,y0:y1,x0:x1]).float(), (x_tgt[...,y0:y1,x0:x1]).float()).mean()
@@ -859,9 +1050,59 @@ def main(args):
                                 l_lpips.append(loss_lpips.item())
                                 l_psnr.append(psnr)
 
+                                scene_id = batch_val["scene_id"][0]
+                                if scene_id not in per_scene_psnr:
+                                    per_scene_psnr[scene_id] = []
+                                per_scene_psnr[scene_id].append(psnr)
+
+                                if use_gate:
+                                    fuse_l_l2.append(fuse_loss_l2.item())
+                                    fuse_l_lpips.append(fuse_loss_lpips.item())
+                                    fuse_l_psnr.append(fuse_psnr)
+                                    if scene_id not in fuse_per_scene_psnr:
+                                        fuse_per_scene_psnr[scene_id] = []
+                                    fuse_per_scene_psnr[scene_id].append(fuse_psnr)
+
                         logs["val/l2"] = np.mean(l_l2)
                         logs["val/lpips"] = np.mean(l_lpips)
                         logs["val/psnr"] = np.mean(l_psnr)
+                        if use_gate:
+                            logs["val/fuse_l2"] = np.mean(fuse_l_l2)
+                            logs["val/fuse_lpips"] = np.mean(fuse_l_lpips)
+                            logs["val/fuse_psnr"] = np.mean(fuse_l_psnr)
+
+
+                        for k, v in per_scene_psnr.items():
+                            logs[f"val_scene/{k}/psnr"] = np.mean(v)
+                        if use_gate:
+                            logs["val/fuse_psnr"] = np.mean(fuse_l_psnr)
+                            for k, v in fuse_per_scene_psnr.items():
+                                logs[f"val_scene/{k}/fuse_psnr"] = np.mean(v)
+
+                        robust_nerf = []
+                        fuse_robust_nerf = []
+                        on_the_go = []
+                        fuse_on_the_go = []
+                        for k in per_scene_psnr:
+                            if k in DATASET_IDS["robust_nerf"]:
+                                robust_nerf.append(np.mean(per_scene_psnr[k]))
+                                if use_gate:
+                                    fuse_robust_nerf.append(np.mean(fuse_per_scene_psnr[k]))
+                            elif k in DATASET_IDS["on-the-go"]:
+                                on_the_go.append(np.mean(per_scene_psnr[k]))
+                                if use_gate:
+                                    fuse_on_the_go.append(np.mean(fuse_per_scene_psnr[k]))           
+                            else:
+                                raise ValueError("Something went wrong!")
+                        
+                        logs["val_dataset/robust_nerf/psnr"] = np.mean(robust_nerf)
+                        if use_gate:
+                            logs["val_dataset/robust_nerf/fuse_psnr"] = np.mean(fuse_robust_nerf)
+
+                        logs["val_dataset/on_the_go/psnr"] = np.mean(on_the_go)
+                        if use_gate:
+                            logs["val_dataset/on_the_go/fuse_psnr"] = np.mean(fuse_on_the_go)
+
                         for k in log_dict:
                             logs[k] = log_dict[k]
                         gc.collect()

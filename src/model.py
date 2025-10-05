@@ -266,8 +266,18 @@ class Difix(torch.nn.Module):
         
         z_denoised = self.sched.step(model_pred, self.timesteps, z, return_dict=True).prev_sample
         self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
-        output_image = (self.vae.decode(z_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
+        residual = False
+        if residual:
+            output_image = (self.vae.decode(z_denoised / self.vae.config.scaling_factor).sample)
+        else:
+            output_image = (self.vae.decode(z_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
         output_image = rearrange(output_image, '(b v) c h w -> b v c h w', v=num_views)
+        
+        # TODO: assume output is tgt-src
+        # then, new output is src + tgt - src
+        if residual:
+            output_image += x
+            output_image = output_image.clamp(-1, 1)
         
         return output_image
     
@@ -304,3 +314,132 @@ class Difix(torch.nn.Module):
         sd["optimizer"] = optimizer.state_dict()
         
         torch.save(sd, outf)
+
+class GatedFuse2(torch.nn.Module):
+    def __init__(self, hidden=32, use_residual=True):
+        super().__init__()
+        in_ch = 3 + 3 + 3  # [sd_out, src, diff]
+        self.enc = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, hidden, 3, padding=1),
+            torch.nn.LeakyReLU(inplace=True),
+            torch.nn.Conv2d(hidden, hidden, 3, padding=1),
+            torch.nn.LeakyReLU(inplace=True),
+        )
+        self.gate = torch.nn.Sequential(
+            torch.nn.Conv2d(hidden, 16, 1), torch.nn.LeakyReLU(inplace=True),
+            torch.nn.Conv2d(16, 1, 1), torch.nn.Sigmoid()
+        )
+
+        # ---- init gate to ~0 ----
+        #with torch.no_grad():
+            #last = self.gate[2]             # Conv2d(16,1,1)  (indices: 0,1,2,3)
+            #torch.nn.init.normal_(last.weight, mean=0.0, std=1e-3)  # small, not zero
+            #torch.nn.init.constant_(last.bias, -5.0)  # sigmoid(-6) ≈ 0.0025, grads ~2.5e-3
+
+        #if self.use_residual:
+        #    self.delta = nn.Sequential(
+        #        nn.Conv2d(hidden, 16, 1), nn.ReLU(inplace=True),
+        #        nn.Conv2d(16, 3, 1)
+        #    )
+
+    def forward(self, sd_out, src):
+        # B,V,C,H,W
+        b, v, c, h, w = sd_out.shape
+        assert v==1
+        sd_out = sd_out[:, 0]
+        src = src[:, 0]
+        diff = sd_out - src
+        x = torch.cat([sd_out, src, diff], dim=1)   # (B,9,H,W)
+        h = self.enc(x)                                    # (B,32,H,W)
+        g = self.gate(h)                                   # (B,1,H,W)
+        fused = (1 - g) * src + g * sd_out
+        #if self.use_residual:
+        #    fused = fused + g * self.delta(h)              # (B,3,H,W)
+        fused = fused.unsqueeze(1)
+        #print("@@@@", g)
+        g = g.unsqueeze(1)*2-1
+        #print("#######", fused.shape, g.shape)
+        #print(g)
+        return fused.clamp(-1, 1), g
+
+
+
+class DWConv3x3(torch.nn.Module):
+    def __init__(self, in_ch, out_ch, dilation=1):
+        super().__init__()
+        pad = dilation
+        self.dw = torch.nn.Conv2d(in_ch, in_ch, 3, padding=pad, dilation=dilation,
+                                  groups=in_ch, bias=False)
+        self.pw = torch.nn.Conv2d(in_ch, out_ch, 1, bias=False)
+    def forward(self, x):
+        return self.pw(self.dw(x))
+
+class ResBlock(torch.nn.Module):
+    def __init__(self, ch, dilation=1):
+        super().__init__()
+        self.conv1 = DWConv3x3(ch, ch, dilation=dilation)
+        self.gn1   = torch.nn.GroupNorm(8, ch, affine=False)
+        self.act   = torch.nn.LeakyReLU(0.1, inplace=True)
+        self.conv2 = DWConv3x3(ch, ch, dilation=1)
+        self.gn2   = torch.nn.GroupNorm(8, ch, affine=False)
+    def forward(self, x):
+        h = self.act(self.gn1(self.conv1(x)))
+        h = self.gn2(self.conv2(h))
+        return self.act(x + h)
+
+class GatedFuse(torch.nn.Module):
+    def __init__(self, base_ch=64):
+        super().__init__()
+        in_ch = 3 + 3 + 3  # [sd_out, src, diff]
+        self.e1 = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, base_ch, 3, padding=1, bias=False),
+            torch.nn.GroupNorm(8, base_ch, affine=False),
+            torch.nn.LeakyReLU(0.1, inplace=True),
+            ResBlock(base_ch, dilation=2),
+            ResBlock(base_ch, dilation=1),
+        )
+        self.down1 = torch.nn.Conv2d(base_ch, base_ch*2, 3, stride=2, padding=1)
+        self.e2 = torch.nn.Sequential(
+            ResBlock(base_ch*2, dilation=2),
+            ResBlock(base_ch*2, dilation=1),
+        )
+        self.down2 = torch.nn.Conv2d(base_ch*2, base_ch*4, 3, stride=2, padding=1)
+        self.e3 = torch.nn.Sequential(
+            ResBlock(base_ch*4, dilation=4),
+            ResBlock(base_ch*4, dilation=2),
+        )
+        self.up1 = torch.nn.ConvTranspose2d(base_ch*4, base_ch*2, 2, stride=2)
+        self.d1 = torch.nn.Sequential(
+            ResBlock(base_ch*2, dilation=2),
+            ResBlock(base_ch*2, dilation=1),
+        )
+        self.up2 = torch.nn.ConvTranspose2d(base_ch*2, base_ch, 2, stride=2)
+        self.d2 = torch.nn.Sequential(
+            ResBlock(base_ch, dilation=2),
+            ResBlock(base_ch, dilation=1),
+        )
+        self.head = torch.nn.Conv2d(base_ch, 1, 1)
+        with torch.no_grad():
+            torch.nn.init.normal_(self.head.weight, 0.0, 1e-3)
+            torch.nn.init.zeros_(self.head.bias)
+
+    def forward(self, sd_out, src):
+        b, v, c, h, w = sd_out.shape
+        sd = sd_out[:, 0]
+        sc = src[:, 0]
+        diff = sd - sc
+        x = torch.cat([sd, sc, diff], dim=1)
+
+        h1 = self.e1(x)
+        h2 = self.e2(self.down1(h1))
+        h3 = self.e3(self.down2(h2))
+        u2 = self.up1(h3) + h2
+        u2 = self.d1(u2)
+        u1 = self.up2(u2) + h1
+        feat = self.d2(u1)
+
+        g_logits = self.head(feat)
+        g = torch.tanh(g_logits)
+        g01 = (g + 1) * 0.5
+        fused = (1 - g01) * sc + g01 * sd
+        return fused.unsqueeze(1).clamp(-1, 1), g.unsqueeze(1)

@@ -129,7 +129,7 @@ class PairedDatasetCus(torch.utils.data.Dataset):
         if split == "train" and select:
             ks = list(self.data.keys())
             for k in ks:
-                if self.data[k]["lpips"] > 0.6:
+                if self.data[k]["lpips"] > 0.3:
                     del self.data[k]
         self.img_ids = list(self.data.keys())
         self.image_size = (height, width)
