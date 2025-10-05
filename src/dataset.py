@@ -303,7 +303,7 @@ class PairedDatasetCur(torch.utils.data.Dataset):
         useRender=False,
         stich=False,
         num_buckets=10,
-        unlock_schedule=[1, 3, 5, 7, 9, 11, 13, 15, 17, 20],
+        unlock_schedule=[1, 3, 5, 7, 9, 12, 15, 19, 23, 27],
         old_ratio=0.5,
         use_prev_union=True,
         seed=42,

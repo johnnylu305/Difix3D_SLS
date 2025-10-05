@@ -321,23 +321,23 @@ def main(args):
 
     # get attention
     # --- attach processors to exactly one down/mid/up self-attn (attn1) ---
-    unet_ref = net_difix.unet  # keep a non-wrapped reference for name matching (before accelerator.prepare)
-    down_set = mid_set = up_set = False
-    for name, module in unet_ref.named_modules():
-        if hasattr(module, "attn1"): #1"):
-            #print(name, module)
-            if (not down_set) and ("down_blocks.0.attentions.1.transformer_blocks.0" in name):
-                REC_PROCS["down"] = RecordingAttnProcessor("down")
-                module.attn1.set_processor(REC_PROCS["down"])
-                down_set = True
-            elif (not mid_set) and ("mid_block.attentions.0.transformer_blocks.0" in name):
-                REC_PROCS["mid"] = RecordingAttnProcessor("mid")
-                module.attn1.set_processor(REC_PROCS["mid"])
-                mid_set = True
-            elif (not up_set) and ("up_blocks.3.attentions.2.transformer_blocks.0" in name):
-                REC_PROCS["up"] = RecordingAttnProcessor("up")
-                module.attn1.set_processor(REC_PROCS["up"])
-                up_set = True
+    #unet_ref = net_difix.unet  # keep a non-wrapped reference for name matching (before accelerator.prepare)
+    #down_set = mid_set = up_set = False
+    #for name, module in unet_ref.named_modules():
+    #    if hasattr(module, "attn1"): #1"):
+    #        #print(name, module)
+    #        if (not down_set) and ("down_blocks.0.attentions.1.transformer_blocks.0" in name):
+    #            REC_PROCS["down"] = RecordingAttnProcessor("down")
+    #            module.attn1.set_processor(REC_PROCS["down"])
+    #            down_set = True
+    #        elif (not mid_set) and ("mid_block.attentions.0.transformer_blocks.0" in name):
+    #            REC_PROCS["mid"] = RecordingAttnProcessor("mid")
+    #            module.attn1.set_processor(REC_PROCS["mid"])
+    #            mid_set = True
+    #        elif (not up_set) and ("up_blocks.3.attentions.2.transformer_blocks.0" in name):
+    #            REC_PROCS["up"] = RecordingAttnProcessor("up")
+    #            module.attn1.set_processor(REC_PROCS["up"])
+    #            up_set = True
     
     # Original difix
     pipe = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
@@ -717,7 +717,7 @@ def main(args):
     # start the training loop
     for epoch in range(0, args.num_training_epochs):
 
-        dl_train.set_epoch(epoch)   # unlock harder buckets progressively
+        dl_train.dataset.set_epoch(epoch)   # unlock harder buckets progressively
         print(f"Epoch {epoch} → unlocked bucket: {dl_train.dataset._unlocked_bucket}, uniform_all: {dl_train.dataset._uniform_all}")
 
         for step, batch in enumerate(dl_train):
@@ -738,13 +738,13 @@ def main(args):
                     else:
                         raise NotImplementedError("Not Implemented")
                 # get attention
-                if accelerator.is_main_process and (global_step % 100 == 0):
-                    _, V, _, _, _ = x_src.shape  # number of views in this batch
-                    for tag in ("down", "mid", "up"):
-                        proc = REC_PROCS[tag]
-                        h, w = ATT_HW[tag]
-                        #if proc is not None and proc.last_attn_probs is not None:
-                        save_avg_attn_map(proc.avg_attn_vec, x_src, tag+"_"+str(global_step), h, w)
+                #if accelerator.is_main_process and (global_step % 100 == 0):
+                #    _, V, _, _, _ = x_src.shape  # number of views in this batch
+                #    for tag in ("down", "mid", "up"):
+                #        proc = REC_PROCS[tag]
+                #        h, w = ATT_HW[tag]
+                #        #if proc is not None and proc.last_attn_probs is not None:
+                #        save_avg_attn_map(proc.avg_attn_vec, x_src, tag+"_"+str(global_step), h, w)
 
                 x_tgt = rearrange(x_tgt, 'b v c h w -> (b v) c h w')
                 x_tgt_pred = rearrange(x_tgt_pred, 'b v c h w -> (b v) c h w')
@@ -1133,7 +1133,7 @@ if __name__ == "__main__":
 
     # validation eval args
     parser.add_argument("--eval_freq", default=100, type=int)
-    parser.add_argument("--num_samples_eval", type=int, default=30, help="Number of samples to use for all evaluation")
+    parser.add_argument("--num_samples_eval", type=int, default=600, help="Number of samples to use for all evaluation")
 
     parser.add_argument("--viz_freq", type=int, default=100, help="Frequency of visualizing the outputs.")
     parser.add_argument("--tracker_project_name", type=str, default="johnnylu/DifixSLS", help="The name of the wandb project to log to.")
